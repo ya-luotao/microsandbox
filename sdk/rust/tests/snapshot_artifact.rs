@@ -13,8 +13,8 @@ use std::sync::Arc;
 use microsandbox::Snapshot;
 use microsandbox::backend::{Backend, LocalBackend};
 use microsandbox_image::snapshot::{
-    DEFAULT_UPPER_FILE, ImageRef, MANIFEST_FILENAME, Manifest, SCHEMA_VERSION, SnapshotFormat,
-    UpperIntegrity, UpperLayer,
+    DEFAULT_UPPER_FILE, DESCRIPTOR_FILENAME, ImageRef, Manifest, SCHEMA_VERSION,
+    SNAPSHOT_ARTIFACT_KIND, SnapshotFormat, SnapshotScope, UpperIntegrity, UpperLayer,
 };
 use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
@@ -39,6 +39,50 @@ struct SeededImageCache {
 /// file. Returns `(artifact_dir, manifest_digest)`.
 fn make_artifact(parent: &Path, name: &str, upper_bytes: &[u8]) -> (std::path::PathBuf, String) {
     make_artifact_with_parent_and_integrity(parent, name, upper_bytes, None, false)
+}
+
+fn make_artifact_with_scope(
+    parent: &Path,
+    name: &str,
+    upper_bytes: &[u8],
+    scope: SnapshotScope,
+) -> (std::path::PathBuf, String) {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(DEFAULT_UPPER_FILE), upper_bytes).unwrap();
+
+    let manifest = Manifest {
+        scope,
+        ..sample_manifest(upper_bytes.len() as u64)
+    };
+    let bytes = manifest.to_canonical_bytes().unwrap();
+    let digest = manifest.digest().unwrap();
+    std::fs::write(dir.join(DESCRIPTOR_FILENAME), bytes).unwrap();
+    (dir, digest)
+}
+
+fn sample_manifest(upper_size: u64) -> Manifest {
+    Manifest {
+        schema: SCHEMA_VERSION,
+        artifact: SNAPSHOT_ARTIFACT_KIND.into(),
+        scope: SnapshotScope::Disk,
+        format: SnapshotFormat::Raw,
+        fstype: "ext4".into(),
+        image: ImageRef {
+            reference: "docker.io/library/alpine:3.20".into(),
+            manifest_digest:
+                "sha256:0000000000000000000000000000000000000000000000000000000000000001".into(),
+        },
+        parent: None,
+        created_at: "2026-05-01T12:00:00Z".into(),
+        labels: BTreeMap::new(),
+        upper: UpperLayer {
+            file: DEFAULT_UPPER_FILE.into(),
+            size_bytes: upper_size,
+            integrity: None,
+        },
+        source_sandbox: Some("synthetic".into()),
+    }
 }
 
 fn make_artifact_with_integrity(
@@ -79,28 +123,12 @@ fn make_artifact_with_parent_and_integrity(
         digest: format!("sha256:{}", hex::encode(hasher.finalize())),
     });
 
-    let manifest = Manifest {
-        schema: SCHEMA_VERSION,
-        format: SnapshotFormat::Raw,
-        fstype: "ext4".into(),
-        image: ImageRef {
-            reference: "docker.io/library/alpine:3.20".into(),
-            manifest_digest:
-                "sha256:0000000000000000000000000000000000000000000000000000000000000001".into(),
-        },
-        parent: parent_digest,
-        created_at: "2026-05-01T12:00:00Z".into(),
-        labels: BTreeMap::new(),
-        upper: UpperLayer {
-            file: DEFAULT_UPPER_FILE.into(),
-            size_bytes: upper_bytes.len() as u64,
-            integrity: upper_integrity,
-        },
-        source_sandbox: Some("synthetic".into()),
-    };
+    let mut manifest = sample_manifest(upper_bytes.len() as u64);
+    manifest.parent = parent_digest;
+    manifest.upper.integrity = upper_integrity;
     let bytes = manifest.to_canonical_bytes().unwrap();
     let digest = manifest.digest().unwrap();
-    std::fs::write(dir.join(MANIFEST_FILENAME), bytes).unwrap();
+    std::fs::write(dir.join(DESCRIPTOR_FILENAME), bytes).unwrap();
     (dir, digest)
 }
 
@@ -115,27 +143,14 @@ fn make_artifact_with_image(
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(DEFAULT_UPPER_FILE), upper_bytes).unwrap();
 
-    let manifest = Manifest {
-        schema: SCHEMA_VERSION,
-        format: SnapshotFormat::Raw,
-        fstype: "ext4".into(),
-        image: ImageRef {
-            reference: image_reference,
-            manifest_digest: image_manifest_digest,
-        },
-        parent: None,
-        created_at: "2026-05-01T12:00:00Z".into(),
-        labels: BTreeMap::new(),
-        upper: UpperLayer {
-            file: DEFAULT_UPPER_FILE.into(),
-            size_bytes: upper_bytes.len() as u64,
-            integrity: None,
-        },
-        source_sandbox: Some("synthetic".into()),
+    let mut manifest = sample_manifest(upper_bytes.len() as u64);
+    manifest.image = ImageRef {
+        reference: image_reference,
+        manifest_digest: image_manifest_digest,
     };
     let bytes = manifest.to_canonical_bytes().unwrap();
     let digest = manifest.digest().unwrap();
-    std::fs::write(dir.join(MANIFEST_FILENAME), bytes).unwrap();
+    std::fs::write(dir.join(DESCRIPTOR_FILENAME), bytes).unwrap();
     (dir, digest)
 }
 
@@ -194,8 +209,8 @@ fn write_archive_from_artifacts(archive: &Path, artifacts: &[(&Path, &str)]) {
     for (artifact, archive_name) in artifacts {
         builder
             .append_path_with_name(
-                artifact.join(MANIFEST_FILENAME),
-                format!("{archive_name}/{MANIFEST_FILENAME}"),
+                artifact.join(DESCRIPTOR_FILENAME),
+                format!("{archive_name}/{DESCRIPTOR_FILENAME}"),
             )
             .unwrap();
         builder
@@ -272,6 +287,97 @@ async fn open_reads_valid_artifact_metadata() {
     assert_eq!(snap.size_bytes(), b"upper data goes here".len() as u64);
 }
 
+#[test]
+fn builder_supports_name_first_contract() {
+    let config = Snapshot::builder("clean-python")
+        .from_sandbox("build-box")
+        .label("stage", "deps")
+        .build()
+        .unwrap();
+
+    assert_eq!(config.name, "clean-python");
+    assert_eq!(config.source_sandbox, "build-box");
+    assert_eq!(config.labels, vec![("stage".into(), "deps".into())]);
+}
+
+#[test]
+fn builder_carries_dest_dir() {
+    let config = Snapshot::builder("clean")
+        .from_sandbox("box")
+        .dest_dir("/mnt/big")
+        .build()
+        .unwrap();
+    assert_eq!(config.name, "clean");
+    assert_eq!(
+        config.dest_dir.as_deref(),
+        Some(std::path::Path::new("/mnt/big"))
+    );
+}
+
+#[test]
+fn builder_requires_source_sandbox() {
+    let err = Snapshot::builder("clean").build().unwrap_err();
+    assert!(err.to_string().contains("from_sandbox"));
+}
+
+#[tokio::test]
+async fn legacy_manifest_json_artifacts_are_not_recognized() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("legacy");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(DEFAULT_UPPER_FILE), b"old upper bytes").unwrap();
+    std::fs::write(
+        dir.join("manifest.json"),
+        br#"{"schema":1,"format":"raw","fstype":"ext4","image":{"ref":"docker.io/library/alpine:3.20","manifest_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000001"},"parent":null,"created_at":"2026-05-01T12:00:00Z","labels":{},"upper":{"file":"upper.ext4","size_bytes":15,"integrity":null},"source_sandbox":"synthetic"}"#,
+    )
+    .unwrap();
+
+    let err = Snapshot::open(dir.to_string_lossy().as_ref())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(DESCRIPTOR_FILENAME));
+
+    let snaps = Snapshot::list_dir(tmp.path()).await.unwrap();
+    assert!(snaps.is_empty());
+}
+
+#[tokio::test]
+async fn open_accepts_resumable_scope_artifact() {
+    let tmp = TempDir::new().unwrap();
+    let (dir, _) = make_artifact_with_scope(
+        tmp.path(),
+        "resumable-snap",
+        b"upper",
+        SnapshotScope::Resumable,
+    );
+
+    let snap = Snapshot::open(dir.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    assert_eq!(snap.manifest().scope, SnapshotScope::Resumable);
+}
+
+#[tokio::test]
+async fn from_snapshot_rejects_resumable_scope_at_restore() {
+    let tmp = TempDir::new().unwrap();
+    let (dir, _) = make_artifact_with_scope(
+        tmp.path(),
+        "resumable-snap",
+        b"upper",
+        SnapshotScope::Resumable,
+    );
+
+    let err = microsandbox::Sandbox::builder("restore-scope-test")
+        .from_snapshot(dir.to_string_lossy().to_string())
+        .build()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("non-disk"),
+        "unexpected error: {err}"
+    );
+}
+
 #[tokio::test]
 async fn open_rejects_tampered_upper_size() {
     let tmp = TempDir::new().unwrap();
@@ -328,7 +434,7 @@ async fn open_rejects_unknown_schema() {
     std::fs::write(dir.join(DEFAULT_UPPER_FILE), b"data").unwrap();
     // Hand-write a manifest with an unknown schema version.
     std::fs::write(
-        dir.join(MANIFEST_FILENAME),
+        dir.join(DESCRIPTOR_FILENAME),
         br#"{"schema":42,"format":"raw","fstype":"ext4","image":{"ref":"x","manifest_digest":"sha256:01"},"parent":null,"created_at":"2026-05-01T12:00:00Z","labels":{},"upper":{"file":"upper.ext4","size_bytes":4,"integrity":null},"source_sandbox":null}"#,
     )
     .unwrap();
@@ -351,15 +457,15 @@ async fn list_dir_skips_non_artifact_directories() {
 }
 
 #[tokio::test]
-async fn export_then_import_round_trips_via_zstd() {
+async fn save_then_load_round_trips_via_zstd() {
     let tmp = TempDir::new().unwrap();
     let (dir, original_digest) = make_artifact(tmp.path(), "src-snap", b"the upper bytes");
 
     let archive = tmp.path().join("bundle.tar.zst");
-    Snapshot::export(
+    Snapshot::save(
         dir.to_string_lossy().as_ref(),
         &archive,
-        microsandbox::snapshot::ExportOpts::default(),
+        microsandbox::snapshot::SaveOpts::default(),
     )
     .await
     .unwrap();
@@ -367,7 +473,7 @@ async fn export_then_import_round_trips_via_zstd() {
     assert!(std::fs::metadata(&archive).unwrap().len() > 0);
 
     let dest = tmp.path().join("imported");
-    let handle = Snapshot::import(&archive, Some(&dest)).await.unwrap();
+    let handle = Snapshot::load(&archive, Some(&dest)).await.unwrap();
     assert_eq!(handle.digest(), original_digest);
 
     // Re-open the imported artifact via path; integrity should hold.
@@ -378,15 +484,15 @@ async fn export_then_import_round_trips_via_zstd() {
 }
 
 #[tokio::test]
-async fn export_then_import_round_trips_via_plain_tar() {
+async fn save_then_load_round_trips_via_plain_tar() {
     let tmp = TempDir::new().unwrap();
     let (dir, original_digest) = make_artifact(tmp.path(), "src-plain", b"plain tar bytes");
 
     let archive = tmp.path().join("bundle.tar");
-    Snapshot::export(
+    Snapshot::save(
         dir.to_string_lossy().as_ref(),
         &archive,
-        microsandbox::snapshot::ExportOpts {
+        microsandbox::snapshot::SaveOpts {
             plain_tar: true,
             ..Default::default()
         },
@@ -395,12 +501,12 @@ async fn export_then_import_round_trips_via_plain_tar() {
     .unwrap();
 
     let dest = tmp.path().join("imported-plain");
-    let handle = Snapshot::import(&archive, Some(&dest)).await.unwrap();
+    let handle = Snapshot::load(&archive, Some(&dest)).await.unwrap();
     assert_eq!(handle.digest(), original_digest);
 }
 
 #[tokio::test]
-async fn export_with_image_includes_only_pinned_cache_artifacts() {
+async fn save_with_image_includes_only_pinned_cache_artifacts() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let backend = isolated_backend(&home).await;
@@ -420,10 +526,10 @@ async fn export_with_image_includes_only_pinned_cache_artifacts() {
     let archive = tmp.path().join("with-image.tar");
 
     microsandbox::with_backend(backend, async {
-        Snapshot::export(
+        Snapshot::save(
             dir.to_string_lossy().as_ref(),
             &archive,
-            microsandbox::snapshot::ExportOpts {
+            microsandbox::snapshot::SaveOpts {
                 with_image: true,
                 plain_tar: true,
                 ..Default::default()
@@ -467,7 +573,7 @@ async fn export_with_image_includes_only_pinned_cache_artifacts() {
 }
 
 #[tokio::test]
-async fn import_rejects_symlink_entries_without_writing_outside_dest() {
+async fn load_rejects_symlink_entries_without_writing_outside_dest() {
     let tmp = TempDir::new().unwrap();
     let archive = tmp.path().join("malicious.tar");
     let dest = tmp.path().join("dest");
@@ -477,7 +583,7 @@ async fn import_rejects_symlink_entries_without_writing_outside_dest() {
 
     write_symlink_traversal_archive(&archive, &escape_dir);
 
-    let err = Snapshot::import(&archive, Some(&dest))
+    let err = Snapshot::load(&archive, Some(&dest))
         .await
         .expect_err("expected import to reject symlink archive entry");
 
@@ -498,7 +604,7 @@ async fn import_rejects_symlink_entries_without_writing_outside_dest() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn import_does_not_follow_preexisting_symlink_parent() {
+async fn load_does_not_follow_preexisting_symlink_parent() {
     let tmp = TempDir::new().unwrap();
     let archive = tmp.path().join("regular.tar");
     let dest = tmp.path().join("dest");
@@ -509,7 +615,7 @@ async fn import_does_not_follow_preexisting_symlink_parent() {
     std::os::unix::fs::symlink(&escape_dir, dest.join("snap")).unwrap();
     write_regular_file_archive(&archive, "snap/pwned.txt", b"should not escape\n");
 
-    let err = Snapshot::import(&archive, Some(&dest))
+    let err = Snapshot::load(&archive, Some(&dest))
         .await
         .expect_err("expected import without a manifest to fail");
 
@@ -531,27 +637,10 @@ async fn open_rejects_manifest_upper_file_that_escapes_artifact() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(tmp.path().join("outside.ext4"), b"data").unwrap();
 
-    let manifest = Manifest {
-        schema: SCHEMA_VERSION,
-        format: SnapshotFormat::Raw,
-        fstype: "ext4".into(),
-        image: ImageRef {
-            reference: "docker.io/library/alpine:3.20".into(),
-            manifest_digest:
-                "sha256:0000000000000000000000000000000000000000000000000000000000000001".into(),
-        },
-        parent: None,
-        created_at: "2026-05-01T12:00:00Z".into(),
-        labels: BTreeMap::new(),
-        upper: UpperLayer {
-            file: "../outside.ext4".into(),
-            size_bytes: 4,
-            integrity: None,
-        },
-        source_sandbox: Some("synthetic".into()),
-    };
+    let mut manifest = sample_manifest(4);
+    manifest.upper.file = "../outside.ext4".into();
     std::fs::write(
-        dir.join(MANIFEST_FILENAME),
+        dir.join(DESCRIPTOR_FILENAME),
         manifest.to_canonical_bytes().unwrap(),
     )
     .unwrap();
@@ -566,7 +655,7 @@ async fn open_rejects_manifest_upper_file_that_escapes_artifact() {
 }
 
 #[tokio::test]
-async fn import_verifies_every_snapshot_manifest_before_indexing() {
+async fn load_verifies_every_snapshot_manifest_before_indexing() {
     let tmp = TempDir::new().unwrap();
     let (bad_dir, _) = make_artifact_with_integrity(tmp.path(), "bad-snap", b"original", true);
     std::fs::write(bad_dir.join(DEFAULT_UPPER_FILE), b"tampered").unwrap();
@@ -581,7 +670,7 @@ async fn import_verifies_every_snapshot_manifest_before_indexing() {
     );
 
     let dest = tmp.path().join("imported");
-    let err = Snapshot::import(&archive, Some(&dest))
+    let err = Snapshot::load(&archive, Some(&dest))
         .await
         .expect_err("expected tampered sibling to fail import");
 
@@ -596,26 +685,26 @@ async fn import_verifies_every_snapshot_manifest_before_indexing() {
 }
 
 #[tokio::test]
-async fn import_detects_zstd_by_magic_bytes() {
+async fn load_detects_zstd_by_magic_bytes() {
     let tmp = TempDir::new().unwrap();
     let (dir, original_digest) = make_artifact(tmp.path(), "src-magic", b"magic zstd");
 
     let archive = tmp.path().join("bundle.snapshot");
-    Snapshot::export(
+    Snapshot::save(
         dir.to_string_lossy().as_ref(),
         &archive,
-        microsandbox::snapshot::ExportOpts::default(),
+        microsandbox::snapshot::SaveOpts::default(),
     )
     .await
     .unwrap();
 
     let dest = tmp.path().join("imported-magic");
-    let handle = Snapshot::import(&archive, Some(&dest)).await.unwrap();
+    let handle = Snapshot::load(&archive, Some(&dest)).await.unwrap();
     assert_eq!(handle.digest(), original_digest);
 }
 
 #[tokio::test]
-async fn import_selects_child_head_when_parents_are_present() {
+async fn load_selects_child_head_when_parents_are_present() {
     let tmp = TempDir::new().unwrap();
     let (parent_dir, parent_digest) = make_artifact(tmp.path(), "parent", b"parent");
     let (child_dir, child_digest) =
@@ -630,13 +719,13 @@ async fn import_selects_child_head_when_parents_are_present() {
     );
 
     let dest = tmp.path().join("imported-chain");
-    let handle = Snapshot::import(&archive, Some(&dest)).await.unwrap();
+    let handle = Snapshot::load(&archive, Some(&dest)).await.unwrap();
     assert_eq!(handle.digest(), child_digest);
     assert_eq!(handle.path(), dest.join("child"));
 }
 
 #[tokio::test]
-async fn failed_import_does_not_install_staged_cache_entries() {
+async fn failed_load_does_not_install_staged_cache_entries() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let backend = isolated_backend(&home).await;
@@ -649,7 +738,7 @@ async fn failed_import_does_not_install_staged_cache_entries() {
     let dest = tmp.path().join("dest");
 
     microsandbox::with_backend(backend, async {
-        let err = Snapshot::import(&archive, Some(&dest))
+        let err = Snapshot::load(&archive, Some(&dest))
             .await
             .expect_err("expected cache-only import to fail");
         assert!(
@@ -666,7 +755,7 @@ async fn failed_import_does_not_install_staged_cache_entries() {
 }
 
 #[tokio::test]
-async fn failed_import_with_conflicting_cache_target_does_not_install_cache_entries() {
+async fn failed_load_with_conflicting_cache_target_does_not_install_cache_entries() {
     let tmp = TempDir::new().unwrap();
     let export_home = tmp.path().join("export-home");
     let export_backend = isolated_backend(&export_home).await;
@@ -684,10 +773,10 @@ async fn failed_import_with_conflicting_cache_target_does_not_install_cache_entr
     microsandbox::with_backend(
         export_backend,
         Box::pin(async {
-            Snapshot::export(
+            Snapshot::save(
                 dir.to_string_lossy().as_ref(),
                 &archive,
-                microsandbox::snapshot::ExportOpts {
+                microsandbox::snapshot::SaveOpts {
                     with_image: true,
                     plain_tar: true,
                     ..Default::default()
@@ -712,7 +801,7 @@ async fn failed_import_with_conflicting_cache_target_does_not_install_cache_entr
     microsandbox::with_backend(
         import_backend,
         Box::pin(async {
-            let err = Snapshot::import(&archive, Some(&dest))
+            let err = Snapshot::load(&archive, Some(&dest))
                 .await
                 .expect_err("expected conflicting cache target to fail import");
             assert!(
@@ -755,7 +844,7 @@ async fn manifest_digest_is_stable_across_processes() {
 // A slurp implementation would allocate 4 GiB and OOM the runner;
 // a streaming implementation reads a few tar blocks and errors fast.
 #[tokio::test]
-async fn import_streams_large_archive_without_buffering() {
+async fn load_streams_large_archive_without_buffering() {
     let tmp = TempDir::new().unwrap();
     let archive = tmp.path().join("sparse.tar");
 
@@ -764,7 +853,7 @@ async fn import_streams_large_archive_without_buffering() {
     drop(file);
 
     let dest = tmp.path().join("dest");
-    let err = Snapshot::import(&archive, Some(&dest))
+    let err = Snapshot::load(&archive, Some(&dest))
         .await
         .expect_err("expected import of sparse archive to fail");
 

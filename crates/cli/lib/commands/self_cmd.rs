@@ -2464,21 +2464,24 @@ mod tests {
 
         rollback_schema(db.inner(), 1).await.unwrap();
 
-        // The latest migration adds `sandbox.active_config`; rolling back one
-        // step must drop the column while leaving older tables intact.
-        let rows = db
+        // The latest migration adds `snapshot_index.scope`; rolling back one
+        // step must drop the column while leaving older schema intact.
+        let columns = db
             .query_all(Statement::from_string(
                 DatabaseBackend::Sqlite,
-                "SELECT name FROM pragma_table_info('sandbox') WHERE name = 'active_config'",
+                "PRAGMA table_info(snapshot_index)",
             ))
             .await
             .unwrap();
-        assert!(rows.is_empty());
+        let has_scope = columns
+            .iter()
+            .any(|row| row.try_get_by_index::<String>(1).unwrap() == "scope");
+        assert!(!has_scope);
 
         let rows = db
             .query_all(Statement::from_string(
                 DatabaseBackend::Sqlite,
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'maintenance_lease'",
+                "SELECT name FROM pragma_table_info('sandbox') WHERE name = 'active_config'",
             ))
             .await
             .unwrap();

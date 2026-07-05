@@ -12,7 +12,7 @@ use crate::{
     RlimitResource, RootfsSource, SandboxLogLevel, SandboxModificationPatch,
     SandboxModificationPlan, SandboxPolicy, SandboxResources, SandboxRuntimeOptions, SandboxSpec,
     SecretChangeKind, SecretModificationPatch, SecretPlannedChange, SecretSource, SecurityProfile,
-    SnapshotDestination, SnapshotSpec, StatVirtualization, VolumeKind, VolumeMount, VolumeSpec,
+    SnapshotSpec, StatVirtualization, VolumeKind, VolumeMount, VolumeSpec,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -65,7 +65,6 @@ pub fn declarations() -> Vec<String> {
         PortProtocol::decl(&cfg),
         HandoffInit::decl(&cfg),
         SandboxPolicy::decl(&cfg),
-        SnapshotDestination::decl(&cfg),
         SnapshotSpec::decl(&cfg),
         SandboxSpec::decl(&cfg),
         SandboxResources::decl(&cfg),
@@ -153,7 +152,7 @@ mod tests {
     fn ts_rs_renders_cloud_contract_declarations() {
         let declarations = declarations();
 
-        assert_eq!(declarations.len(), 53);
+        assert_eq!(declarations.len(), 52);
         assert!(
             declarations
                 .iter()

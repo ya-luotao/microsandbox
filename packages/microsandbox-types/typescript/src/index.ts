@@ -385,17 +385,20 @@ max_duration_secs: number | null,
  */
 idle_timeout_secs: number | null, };
 
-export type SnapshotDestination = { "Name": string } | { "Path": string };
-
 export type SnapshotSpec = {
+/**
+ * Snapshot name. Always the artifact directory's basename.
+ */
+name: string,
+/**
+ * Parent directory to create the artifact in. `None` = the default
+ * snapshots directory.
+ */
+dest_dir: string | null,
 /**
  * Name of the source sandbox. Must be stopped.
  */
 source_sandbox: string,
-/**
- * Where to write the artifact.
- */
-destination: SnapshotDestination,
 /**
  * User-supplied labels.
  */
@@ -407,7 +410,15 @@ force: boolean,
 /**
  * Compute and record upper-layer content integrity at creation time.
  */
-record_integrity: boolean, };
+record_integrity: boolean,
+/**
+ * Request a future resumable snapshot that includes memory/device state.
+ *
+ * This is part of the public contract now so callers can validate shape
+ * early. The local runtime returns an unsupported-feature error until VM
+ * pause/resume capture lands.
+ */
+resumable: boolean, };
 
 export type SandboxSpec = {
 /**
