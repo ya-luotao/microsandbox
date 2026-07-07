@@ -353,6 +353,8 @@ export type PortProtocol = "tcp" | "udp";
 export type HandoffInit = {
 /**
  * Init binary: absolute path inside the guest rootfs, or the literal `auto`.
+ *
+ * Always a Linux-style `/`-separated path — never build it with host OS path APIs, whose semantics diverge on Windows (`\` separators, `/sbin/init` treated as relative).
  */
 cmd: string,
 /**
