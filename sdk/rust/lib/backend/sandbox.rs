@@ -1225,7 +1225,7 @@ pub(super) fn cloud_create_request_from_config(
 
     let image = match image {
         RootfsSource::Oci(image) => image.reference,
-        RootfsSource::Bind(_) => {
+        RootfsSource::Bind { .. } => {
             return Err(unsupported(
                 "image-from-host-dir",
                 "when cloud volumes ship",

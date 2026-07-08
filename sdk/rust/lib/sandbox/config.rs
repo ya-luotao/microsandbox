@@ -963,6 +963,7 @@ mod tests {
                     options: MountOptions::default(),
                     stat_virtualization: StatVirtualization::Strict,
                     host_permissions: crate::sandbox::HostPermissions::Private,
+                    follow_root_symlinks: false,
                 }],
                 ..Default::default()
             },
@@ -1406,6 +1407,7 @@ mod tests {
                     options: MountOptions::default(),
                     stat_virtualization: crate::sandbox::StatVirtualization::Strict,
                     host_permissions: crate::sandbox::HostPermissions::Private,
+                    follow_root_symlinks: false,
                     quota_mib: None,
                 }],
                 ..Default::default()
@@ -1426,7 +1428,10 @@ mod tests {
     fn test_apply_runtime_defaults_skips_non_oci_roots() {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
-                image: RootfsSource::Bind("/tmp/rootfs".into()),
+                image: RootfsSource::Bind {
+                    path: "/tmp/rootfs".into(),
+                    follow_root_symlinks: false,
+                },
                 ..Default::default()
             },
             ..Default::default()
