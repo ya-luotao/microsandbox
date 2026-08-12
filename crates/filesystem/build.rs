@@ -34,14 +34,20 @@ fn build_agentd(workspace_root: &Path, out_dir: &Path) {
         // cannot silently lag behind the freshly built guest agent. A locally
         // built binary has no published digest to compare against, so this
         // branch is explicitly trusted; an externally supplied binary can be
-        // pinned with MSB_AGENTD_SHA256, which verifies fail-closed.
+        // pinned with MSB_AGENTD_SHA256, which verifies fail-closed. The bytes
+        // read for verification are the bytes embedded — the file is never
+        // reopened between the two.
         if local.is_file() {
-            verify_local_agentd(&local);
-            copy_agentd(&local, &dest);
-            return;
-        }
-
-        if dest.exists() {
+            let data = std::fs::read(&local)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", local.display()));
+            match agentd_pin_from_env() {
+                Some(expected) => verify_agentd_digest(&data, &expected),
+                None => println!(
+                    "cargo:warning=embedding local build/{AGENTD_BINARY} without digest \
+                     verification; set MSB_AGENTD_SHA256 to pin an externally supplied binary"
+                ),
+            }
+            write_agentd(&data, &dest);
             return;
         }
 
@@ -55,6 +61,17 @@ fn build_agentd(workspace_root: &Path, out_dir: &Path) {
         let expected = fetch_agentd_digest(&url).unwrap_or_else(|e| {
             panic!("failed to fetch agentd checksums: {e}");
         });
+
+        // Reuse a cached OUT_DIR copy only after re-hashing it against the
+        // published digest: entries written by the pre-verification build
+        // script, or corrupted since, must not be embedded. On mismatch fall
+        // through and replace it with a freshly verified download.
+        if let Ok(cached) = std::fs::read(&dest)
+            && agentd_digest_matches(&cached, &expected)
+        {
+            return;
+        }
+
         eprintln!("Downloading {url}");
         let data = download(&url).unwrap_or_else(|e| {
             panic!("failed to download {url}: {e}");
@@ -95,6 +112,7 @@ fn build_agentd(workspace_root: &Path, out_dir: &Path) {
     }
 }
 
+#[cfg(not(feature = "prebuilt"))]
 fn copy_agentd(local: &Path, dest: &Path) {
     std::fs::copy(local, dest).expect("failed to copy agentd to OUT_DIR");
 }
@@ -159,36 +177,42 @@ fn fetch_agentd_digest(agentd_url: &str) -> Result<String, Box<dyn std::error::E
 }
 
 #[cfg(feature = "prebuilt")]
-fn verify_agentd_digest(data: &[u8], expected: &str) {
+fn agentd_digest_matches(data: &[u8], expected: &str) -> bool {
     use sha2::{Digest as _, Sha256};
 
     let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
+    hex::encode(Sha256::digest(data)).eq_ignore_ascii_case(expected)
+}
+
+#[cfg(feature = "prebuilt")]
+fn verify_agentd_digest(data: &[u8], expected: &str) {
+    use sha2::{Digest as _, Sha256};
+
+    let trimmed = expected.strip_prefix("sha256:").unwrap_or(expected);
     assert!(
-        expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "agentd has an invalid published SHA-256 digest: {expected}"
+        trimmed.len() == 64 && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "agentd has an invalid published SHA-256 digest: {trimmed}"
     );
     let actual = hex::encode(Sha256::digest(data));
     assert!(
-        actual.eq_ignore_ascii_case(expected),
-        "agentd SHA-256 mismatch: expected {expected}, got {actual}"
+        actual.eq_ignore_ascii_case(trimmed),
+        "agentd SHA-256 mismatch: expected {trimmed}, got {actual}"
     );
 }
 
-/// Gate the locally supplied `build/agentd` copy. With `MSB_AGENTD_SHA256`
-/// set, the binary must match that digest (fail-closed); without it the copy
-/// is trusted as a local build artifact and a warning notes the exemption.
+/// Read the `MSB_AGENTD_SHA256` pin for the locally supplied `build/agentd`
+/// copy. Absent means the copy is trusted as a local build artifact; a pin
+/// that is set but not valid UTF-8 is an explicit pin that cannot possibly
+/// match, so it fails the build rather than silently degrading to unverified.
 #[cfg(feature = "prebuilt")]
-fn verify_local_agentd(local: &Path) {
+fn agentd_pin_from_env() -> Option<String> {
     println!("cargo:rerun-if-env-changed=MSB_AGENTD_SHA256");
-    if let Ok(expected) = std::env::var("MSB_AGENTD_SHA256") {
-        let data = std::fs::read(local)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", local.display()));
-        verify_agentd_digest(&data, &expected);
-    } else {
-        println!(
-            "cargo:warning=embedding local build/{AGENTD_BINARY} without digest verification; \
-             set MSB_AGENTD_SHA256 to pin an externally supplied binary"
-        );
+    match std::env::var("MSB_AGENTD_SHA256") {
+        Ok(expected) => Some(expected),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("MSB_AGENTD_SHA256 is set but is not valid UTF-8; refusing to skip verification")
+        }
     }
 }
 
