@@ -23,4 +23,6 @@ default = ["prebuilt"]
 prebuilt = ["microsandbox-utils/http-client"]
 
 [build-dependencies]
+hex.workspace = true
 microsandbox-utils.workspace = true
+sha2.workspace = true

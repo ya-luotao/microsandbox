@@ -3498,10 +3498,12 @@ dependencies = [
 name = "microsandbox-filesystem"
 version = "0.6.8"
 dependencies = [
+ "hex",
  "libc",
  "microsandbox-utils",
  "msb_krun",
  "scopeguard",
+ "sha2 0.11.0",
  "tempfile",
  "tracing",
 ]
