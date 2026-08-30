@@ -13,6 +13,7 @@
 //! `present_frame` must never wait for a viewer: the guest's FLUSH is only
 //! answered once it returns.
 
+pub mod clipboard;
 pub mod dump;
 pub mod input;
 pub mod protocol;
@@ -21,7 +22,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use memmap2::{MmapMut, MmapOptions};
@@ -32,6 +33,7 @@ use msb_krun::krun_display::{
 use msb_krun::krun_input::{InputConfigBackend, InputEvent, InputEventProviderBackend};
 use msb_krun_utils::pollable_channel::PollableChannelSender;
 
+use clipboard::ClipboardPortBackend;
 pub use dump::frame_dump_backend;
 use input::{event, syn, InputDevice};
 use protocol::evdev::*;
@@ -59,6 +61,7 @@ struct Shared {
     scanouts: Mutex<Vec<Option<ScanoutInfo>>>,
     keyboard_tx: PollableChannelSender<InputEvent>,
     pointer_tx: PollableChannelSender<InputEvent>,
+    clipboard: Arc<ClipboardPortBackend>,
 }
 
 impl Shared {
@@ -84,11 +87,17 @@ impl Shared {
         self.send(&ServerMsg::Hello {
             sandbox: self.sandbox.clone(),
         });
-        let scanouts = self.scanouts.lock().unwrap_or_else(|e| e.into_inner());
-        for (scanout, info) in scanouts.iter().enumerate() {
-            if let Some(info) = info {
-                self.send(&configure_msg(scanout as u32, info));
+        {
+            let scanouts = self.scanouts.lock().unwrap_or_else(|e| e.into_inner());
+            for (scanout, info) in scanouts.iter().enumerate() {
+                if let Some(info) = info {
+                    self.send(&configure_msg(scanout as u32, info));
+                }
             }
+        }
+        // A viewer that attached after the guest copied still gets that value.
+        if let Some(msg) = self.clipboard.last_guest() {
+            self.send(&msg);
         }
     }
 
@@ -116,6 +125,10 @@ impl Shared {
             ViewerMsg::Rel { code, value } => self
                 .pointer_tx
                 .send_many([event(EV_REL, code, value as u32), syn()]),
+            ViewerMsg::Clipboard { mime, data } => {
+                self.clipboard.send_to_guest(mime, data);
+                return;
+            }
         };
         if let Err(e) = result {
             tracing::warn!(error = %e, "gpu display: input event dropped");
@@ -146,6 +159,7 @@ impl DisplayServer {
     pub fn start(sandbox: &str, fb_dir: &Path, socket: &Path) -> io::Result<Self> {
         let keyboard = input::keyboard()?;
         let pointer = input::pointer()?;
+        let clipboard = Arc::new(ClipboardPortBackend::new());
         let shared: &'static Shared = Box::leak(Box::new(Shared {
             sandbox: sandbox.to_string(),
             fb_dir: fb_dir.to_path_buf(),
@@ -153,7 +167,10 @@ impl DisplayServer {
             scanouts: Mutex::new((0..MAX_DISPLAYS).map(|_| None).collect()),
             keyboard_tx: keyboard.tx.clone(),
             pointer_tx: pointer.tx.clone(),
+            clipboard: Arc::clone(&clipboard),
         }));
+        // `Shared` had to exist first; the backend only forwards after this.
+        clipboard.set_shared(shared);
         fs::create_dir_all(fb_dir)?;
         let _ = fs::remove_file(socket);
         let listener = UnixListener::bind(socket)?;
@@ -171,6 +188,14 @@ impl DisplayServer {
     /// The display backend to hand to the VM builder.
     pub fn display_backend(&self) -> DisplayBackend<'static> {
         SharedFrameBackend::into_display_backend(Some(self.shared))
+    }
+
+    /// The vsock backend serving the guest clipboard agent.
+    ///
+    /// Register it on [`protocol::CLIPBOARD_VSOCK_PORT`] whenever the display
+    /// server runs, independent of any user-configured vsock routes.
+    pub fn clipboard_backend(&self) -> Arc<ClipboardPortBackend> {
+        Arc::clone(&self.shared.clipboard)
     }
 
     /// The virtual keyboard's backends (once).
