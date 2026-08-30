@@ -4582,6 +4582,7 @@ dependencies = [
 name = "microsandbox-runtime"
 version = "0.6.16"
 dependencies = [
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "clap",
@@ -4854,8 +4855,6 @@ dependencies = [
 [[package]]
 name = "msb_krun_display"
 version = "0.1.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "671d9a38ac506221a85a8d1811e25d22e0eae19f4b7c6e144c3afe1c216d886f"
 dependencies = [
  "bindgen",
  "bitflags 2.11.1",

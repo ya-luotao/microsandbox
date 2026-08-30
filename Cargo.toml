@@ -217,4 +217,5 @@ russh-sftp = "2.3.0"
 [patch.crates-io]
 msb_krun = { path = "third_party/msb_krun" }
 msb_krun_devices = { path = "third_party/msb_krun_devices" }
+msb_krun_display = { path = "third_party/msb_krun_display" }
 msb_krun_utils = { path = "third_party/msb_krun_utils" }

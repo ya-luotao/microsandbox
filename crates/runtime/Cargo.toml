@@ -17,6 +17,7 @@ prebuilt = ["microsandbox-filesystem/prebuilt"]
 net = ["dep:microsandbox-network", "msb_krun/net"]
 
 [dependencies]
+base64.workspace = true
 bytes = { workspace = true }
 chrono.workspace = true
 clap = { workspace = true, features = ["derive"] }
