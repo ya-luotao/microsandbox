@@ -69,6 +69,7 @@ zeroize = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+arboard.workspace = true
 memmap2.workspace = true
 softbuffer.workspace = true
 winit.workspace = true

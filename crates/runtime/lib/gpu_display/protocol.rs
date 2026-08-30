@@ -13,6 +13,15 @@ pub const SLOTS: u32 = 2;
 /// Range of the absolute pointer axes (`ABS_X`/`ABS_Y`), like QEMU's tablet.
 pub const ABS_RANGE: u32 = 32767;
 
+/// Host vsock port the guest clipboard agent connects to (CID 2).
+///
+/// The display server registers an in-process backend on this port whenever it
+/// starts, so the route exists exactly when `MSB_GPU` gave the guest a scanout.
+pub const CLIPBOARD_VSOCK_PORT: u32 = 5910;
+
+/// The only clipboard MIME type this iteration carries.
+pub const TEXT_MIME: &str = "text/plain;charset=utf-8";
+
 /// Messages from the sandbox to the viewer.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +49,8 @@ pub enum ServerMsg {
     },
     /// The guest turned the scanout off.
     Disable { scanout: u32 },
+    /// The guest's clipboard changed; `data` is base64 of the `mime` payload.
+    Clipboard { mime: String, data: String },
 }
 
 /// Messages from the viewer to the sandbox: evdev-style input.
@@ -55,6 +66,28 @@ pub enum ViewerMsg {
     Btn { code: u16, down: bool },
     /// Relative axis event (`REL_WHEEL` etc.).
     Rel { code: u16, value: i32 },
+    /// The host's clipboard changed; `data` is base64 of the `mime` payload.
+    Clipboard { mime: String, data: String },
+}
+
+/// Messages exchanged with the guest clipboard agent on
+/// [`CLIPBOARD_VSOCK_PORT`].
+///
+/// Newline-delimited JSON in both directions, same shape each way, e.g.
+///
+/// ```text
+/// {"t":"set","mime":"text/plain;charset=utf-8","data":"aGVsbG8="}
+/// ```
+///
+/// `data` is standard base64 of the raw selection bytes, so the format already
+/// carries anything a future `mime` (an image, say) needs. Unknown `t` values
+/// are logged and skipped on both ends, which keeps new variants additive.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum GuestClipboardMsg {
+    /// The sender's clipboard now holds `data` (base64) of type `mime`.
+    Set { mime: String, data: String },
 }
 
 /// Linux input event codes used by both ends (`<linux/input-event-codes.h>`).

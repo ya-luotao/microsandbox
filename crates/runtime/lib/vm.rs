@@ -1950,6 +1950,18 @@ fn build_vm(
     } else {
         None
     };
+    // The clipboard route belongs to the display server, not to the user's
+    // `--vsock` routes: register it here so it exists exactly when a scanout
+    // does. `.vsock()` threads the same builder, so this adds to any routes
+    // configured above rather than replacing them.
+    #[cfg(unix)]
+    if let Some(server) = display_server.as_ref() {
+        let backend: std::sync::Arc<dyn msb_krun::backends::vsock::VsockPortBackend> =
+            server.clipboard_backend();
+        builder = builder.vsock(move |vsock| {
+            vsock.custom(crate::gpu_display::protocol::CLIPBOARD_VSOCK_PORT, backend)
+        });
+    }
     #[cfg(unix)]
     {
         builder = builder.console(|c| {

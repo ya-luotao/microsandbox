@@ -10,6 +10,9 @@
 use clap::Args;
 
 /// Open a native window on a running sandbox's display.
+///
+/// Clipboard text is kept in sync with the Mac pasteboard while the window is
+/// open. Set `MSB_DISPLAY_CLIPBOARD=0` to turn that off in both directions.
 #[derive(Debug, Args)]
 pub struct DisplayArgs {
     /// Sandbox whose display to show.
@@ -37,6 +40,7 @@ pub fn run(args: DisplayArgs) -> ! {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::collections::HashSet;
     use std::fs::File;
     use std::io::{BufRead, BufReader, Write};
     use std::num::NonZeroU32;
@@ -46,9 +50,10 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use anyhow::{anyhow, Context};
+    use base64::Engine as _;
     use memmap2::Mmap;
     use microsandbox_runtime::gpu_display::protocol::evdev::*;
-    use microsandbox_runtime::gpu_display::protocol::{ServerMsg, ViewerMsg, ABS_RANGE};
+    use microsandbox_runtime::gpu_display::protocol::{ABS_RANGE, ServerMsg, TEXT_MIME, ViewerMsg};
     use microsandbox_runtime::ipc::{display_socket_path_for, sandbox_socket_paths};
     use winit::application::ApplicationHandler;
     use winit::dpi::PhysicalSize;
@@ -62,6 +67,18 @@ mod macos {
 
     /// Set `MSB_DISPLAY_STATS=1` for a one-line frame/copy summary per second.
     const STATS_ENV: &str = "MSB_DISPLAY_STATS";
+
+    /// Clipboard sync is on unless this is set to something other than `1`.
+    ///
+    /// The pasteboard is pushed into the sandbox whenever the window takes
+    /// focus or a key is pressed, and the guest can replace what the Mac
+    /// holds, so an untrusted image needs a way to opt out of both.
+    const CLIPBOARD_ENV: &str = "MSB_DISPLAY_CLIPBOARD";
+
+    /// Whether to sync the clipboard at all.
+    fn clipboard_enabled() -> bool {
+        std::env::var_os(CLIPBOARD_ENV).is_none_or(|v| v == "1")
+    }
 
     enum UserEvent {
         Server(ServerMsg),
@@ -226,6 +243,14 @@ mod macos {
         scanout: Option<Scanout>,
         wheel_carry: (f32, f32),
         stats: Option<Stats>,
+        /// `None` when the pasteboard is unavailable; clipboard sync is then off.
+        clipboard: Option<arboard::Clipboard>,
+        /// Last text this viewer put on, or read from, the Mac pasteboard.
+        last_host_text: Option<String>,
+        /// Last text the guest sent, so it is never echoed back to the guest.
+        last_guest_text: Option<String>,
+        /// MIME types already reported as unsupported.
+        warned_mimes: HashSet<String>,
     }
 
     impl App {
@@ -256,6 +281,64 @@ mod macos {
             );
             self.window = Some(window);
             self.surface = Some(surface);
+        }
+
+        /// Send the Mac pasteboard to the guest when it holds something new.
+        ///
+        /// Cheap enough to call on focus and on every key press: reading the
+        /// pasteboard is a local call and nothing is sent unless the text
+        /// actually changed.
+        fn sync_host_clipboard(&mut self) {
+            let Some(clipboard) = &mut self.clipboard else {
+                return;
+            };
+            // An empty or non-text pasteboard reads as an error; nothing to do.
+            let Ok(text) = clipboard.get_text() else {
+                return;
+            };
+            if text.is_empty()
+                || self.last_host_text.as_deref() == Some(text.as_str())
+                || self.last_guest_text.as_deref() == Some(text.as_str())
+            {
+                return;
+            }
+            self.sender.send(&ViewerMsg::Clipboard {
+                mime: TEXT_MIME.to_string(),
+                data: base64::engine::general_purpose::STANDARD.encode(&text),
+            });
+            self.last_host_text = Some(text);
+        }
+
+        /// Put the guest's selection on the Mac pasteboard.
+        fn apply_guest_clipboard(&mut self, mime: String, data: String) {
+            // Disabled, or no pasteboard: drop it without even decoding.
+            if self.clipboard.is_none() {
+                return;
+            }
+            if !mime.starts_with("text/plain") {
+                if self.warned_mimes.insert(mime.clone()) {
+                    eprintln!("warning: ignoring clipboard type {mime}");
+                }
+                return;
+            }
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&data) else {
+                eprintln!("warning: bad clipboard payload from sandbox");
+                return;
+            };
+            let Ok(text) = String::from_utf8(bytes) else {
+                eprintln!("warning: clipboard text from sandbox is not UTF-8");
+                return;
+            };
+            let Some(clipboard) = &mut self.clipboard else {
+                return;
+            };
+            if let Err(e) = clipboard.set_text(&text) {
+                eprintln!("warning: cannot set the clipboard: {e}");
+                return;
+            }
+            // Both, so neither the next poll nor a focus event bounces it back.
+            self.last_guest_text = Some(text.clone());
+            self.last_host_text = Some(text);
         }
 
         fn redraw(&mut self) {
@@ -392,6 +475,9 @@ mod macos {
                         self.scanout = None;
                     }
                 }
+                UserEvent::Server(ServerMsg::Clipboard { mime, data }) => {
+                    self.apply_guest_clipboard(mime, data);
+                }
                 UserEvent::Disconnected => {
                     eprintln!("sandbox display closed");
                     event_loop.exit();
@@ -413,9 +499,14 @@ mod macos {
                         window.request_redraw();
                     }
                 }
+                WindowEvent::Focused(true) => self.sync_host_clipboard(),
                 WindowEvent::KeyboardInput { event, .. } => {
                     if event.repeat {
                         return;
+                    }
+                    if event.state == ElementState::Pressed {
+                        // Catches a copy made on the Mac without leaving the window.
+                        self.sync_host_clipboard();
                     }
                     let PhysicalKey::Code(code) = event.physical_key else {
                         return;
@@ -518,6 +609,17 @@ mod macos {
             stats: std::env::var_os(STATS_ENV)
                 .is_some_and(|v| v == "1")
                 .then(Stats::new),
+            clipboard: match clipboard_enabled().then(arboard::Clipboard::new) {
+                None => None,
+                Some(Ok(clipboard)) => Some(clipboard),
+                Some(Err(e)) => {
+                    eprintln!("warning: clipboard sync disabled: {e}");
+                    None
+                }
+            },
+            last_host_text: None,
+            last_guest_text: None,
+            warned_mimes: HashSet::new(),
         };
         event_loop
             .run_app(&mut app)
