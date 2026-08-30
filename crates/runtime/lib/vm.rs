@@ -1412,6 +1412,14 @@ fn gpu_virgl_flags_from_env() -> Option<u32> {
     }
 }
 
+/// `MSB_SND=1` attaches a virtio-snd device wired to the host's default audio
+/// output (CoreAudio on macOS, PipeWire on Linux). Unset or anything else: no
+/// sound device. There is no CLI flag yet; the env var is the only opt-in.
+#[cfg(unix)]
+fn snd_from_env() -> bool {
+    std::env::var("MSB_SND").is_ok_and(|value| value == "1")
+}
+
 /// `MSB_GPU_DISPLAY=WIDTHxHEIGHT` sizes the single scanout (default 1920x1080).
 #[cfg(unix)]
 fn gpu_display_from_env() -> (u32, u32) {
@@ -1957,6 +1965,15 @@ fn build_vm(
                 microsandbox_protocol::AGENT_PORT_NAME,
                 Box::new(console_backend),
             );
+            // Experimental: attach a virtio-snd device so the guest gets an
+            // ALSA card backed by the host's default output. Opt-in via
+            // MSB_SND, independent of the display.
+            let c = if snd_from_env() {
+                tracing::info!("virtio-snd: attaching the host audio device (MSB_SND=1)");
+                c.sound(true)
+            } else {
+                c
+            };
             // Experimental: attach a virtio-gpu device so the guest gets a DRM
             // node. Opt-in via MSB_GPU while the host display path is built out.
             match gpu_virgl_flags_from_env() {

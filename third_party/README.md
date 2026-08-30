@@ -11,6 +11,10 @@ virtio-gpu display (`MSB_GPU`, `msb display`) needs, applied through
   virgl is off (`NO_VIRGL` without `VENUS`), advertises no virgl/blob/context
   features, and copies only the scanout rectangle on flush instead of
   panicking on a size mismatch.
+- `msb_krun_devices`: virtio-snd gets a `cpal` host backend so the device
+  works on macOS (CoreAudio); the PipeWire backend and its dependency are now
+  Linux-only, `BackendType` picks the backend per target, and a failing backend
+  answers the guest with a virtio status instead of panicking the worker thread.
 - `msb_krun_utils`: the macOS pipe-based `EventFd` honours `EFD_NONBLOCK`
   when combined with `EFD_SEMAPHORE` (virtio-input never delivered events
   otherwise).
