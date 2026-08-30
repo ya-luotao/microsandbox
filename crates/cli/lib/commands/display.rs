@@ -43,6 +43,7 @@ mod macos {
     use std::os::unix::net::UnixStream;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use anyhow::{anyhow, Context};
     use memmap2::Mmap;
@@ -59,9 +60,62 @@ mod macos {
     /// Only the first scanout is shown.
     const SCANOUT: u32 = 0;
 
+    /// Set `MSB_DISPLAY_STATS=1` for a one-line frame/copy summary per second.
+    const STATS_ENV: &str = "MSB_DISPLAY_STATS";
+
     enum UserEvent {
         Server(ServerMsg),
         Disconnected,
+    }
+
+    /// A rectangle of the scanout, in scanout pixels.
+    #[derive(Clone, Copy)]
+    struct Rect {
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    }
+
+    impl Rect {
+        /// The smallest rectangle covering both.
+        fn union(self, other: Rect) -> Rect {
+            let x = self.x.min(other.x);
+            let y = self.y.min(other.y);
+            let w = (self.x + self.w).max(other.x + other.w) - x;
+            let h = (self.y + self.h).max(other.y + other.h) - y;
+            Rect { x, y, w, h }
+        }
+
+        /// `[x, y, w, h]` from the wire, clipped to a `sw` x `sh` scanout.
+        /// `None` when the rectangle is malformed or empty; the caller then
+        /// falls back to the whole frame.
+        fn clip(r: [u32; 4], sw: u32, sh: u32) -> Option<Rect> {
+            let [x, y, w, h] = r;
+            if x >= sw || y >= sh {
+                return None;
+            }
+            let (w, h) = (w.min(sw - x), h.min(sh - y));
+            (w != 0 && h != 0).then_some(Rect { x, y, w, h })
+        }
+    }
+
+    /// What changed in the scanout since the last redraw. Frames that arrive
+    /// between two redraws are coalesced, so several damage rectangles merge
+    /// into their bounding box (any whole-frame update wins).
+    #[derive(Clone, Copy)]
+    enum Damage {
+        Full,
+        Part(Rect),
+    }
+
+    impl Damage {
+        fn merge(self, other: Damage) -> Damage {
+            match (self, other) {
+                (Damage::Part(a), Damage::Part(b)) => Damage::Part(a.union(b)),
+                _ => Damage::Full,
+            }
+        }
     }
 
     struct Scanout {
@@ -70,6 +124,167 @@ mod macos {
         frame_size: usize,
         mmap: Mmap,
         slot: usize,
+        /// The last complete frame, in softbuffer's `0RGB` pixels. Damage-only
+        /// updates are copied into it, so it always holds the whole scanout.
+        back: Vec<u32>,
+        scaler: Scaler,
+    }
+
+    impl Scanout {
+        /// Copy the damaged part of the fresh slot into [`Scanout::back`].
+        /// The slot always holds a complete frame, so a rectangle copy leaves
+        /// the rest of the back buffer valid. Returns the bytes copied.
+        fn absorb(&mut self, damage: Option<Damage>) -> usize {
+            let rect = match damage {
+                None => return 0,
+                Some(Damage::Full) => Rect {
+                    x: 0,
+                    y: 0,
+                    w: self.width,
+                    h: self.height,
+                },
+                Some(Damage::Part(r)) => r,
+            };
+            let start = self.slot * self.frame_size;
+            let Some(src) = self.mmap.get(start..start + self.frame_size) else {
+                return 0;
+            };
+            copy_rect(&mut self.back, src, self.width as usize, rect)
+        }
+    }
+
+    /// Copy `rect` of a BGRX frame into the matching place of a `sw`-wide
+    /// `0RGB` buffer, one `memcpy` per row. `rect` must already be clipped to
+    /// the buffer. Returns the bytes copied.
+    fn copy_rect(back: &mut [u32], src: &[u8], sw: usize, rect: Rect) -> usize {
+        let (rx, ry) = (rect.x as usize, rect.y as usize);
+        let (rw, rh) = (rect.w as usize, rect.h as usize);
+        for row in ry..ry + rh {
+            let first = row * sw + rx;
+            let dst = &mut back[first..first + rw];
+            pixels_as_bytes_mut(dst).copy_from_slice(&src[first * 4..(first + rw) * 4]);
+        }
+        rw * rh * 4
+    }
+
+    /// Cached nearest-neighbour x-index table, kept across redraws so a resized
+    /// window costs one table build rather than a division per pixel.
+    #[derive(Default)]
+    struct Scaler {
+        xmap: Vec<u32>,
+        /// `(source width, destination width)` `xmap` was built for.
+        built_for: (usize, usize),
+    }
+
+    impl Scaler {
+        /// Nearest-neighbour scale of a `sw` x `sh` source into a `dw` x `dh`
+        /// destination. Integer factors duplicate pixels and rows with slice
+        /// fills and copies; other sizes use the x-index table. Rows that
+        /// sample the same source row are copied, never recomputed.
+        fn scale_into(
+            &mut self,
+            src: &[u32],
+            (sw, sh): (usize, usize),
+            dst: &mut [u32],
+            (dw, dh): (usize, usize),
+        ) {
+            if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+                return;
+            }
+            if src.len() < sw * sh || dst.len() < dw * dh {
+                return;
+            }
+            let factor = (dw % sw == 0 && dh % sh == 0 && dw / sw == dh / sh).then(|| dw / sw);
+            if factor.is_none() && self.built_for != (sw, dw) {
+                self.xmap = (0..dw).map(|x| (x * sw / dw) as u32).collect();
+                self.built_for = (sw, dw);
+            }
+            // The source row already expanded, and the destination row holding
+            // it — consecutive destination rows usually sample the same one.
+            let mut built: Option<usize> = None;
+            let mut prev = 0usize;
+            for y in 0..dh {
+                let sy = y * sh / dh;
+                let (done, rest) = dst.split_at_mut(y * dw);
+                let row = &mut rest[..dw];
+                if built == Some(sy) {
+                    row.copy_from_slice(&done[prev * dw..prev * dw + dw]);
+                    continue;
+                }
+                let src_row = &src[sy * sw..sy * sw + sw];
+                match factor {
+                    Some(k) => {
+                        for (x, &px) in src_row.iter().enumerate() {
+                            row[x * k..(x + 1) * k].fill(px);
+                        }
+                    }
+                    None => {
+                        for (out, &sx) in row.iter_mut().zip(&self.xmap) {
+                            *out = src_row[sx as usize];
+                        }
+                    }
+                }
+                built = Some(sy);
+                prev = y;
+            }
+        }
+    }
+
+    /// Byte view of a pixel slice. softbuffer's macOS backend takes `0RGB`
+    /// `u32`s and renders them with `NoneSkipFirst` + little-endian byte order
+    /// (`softbuffer-0.4.8/src/backends/cg.rs:326`), so a pixel is `[b, g, r, x]`
+    /// in memory — exactly the guest's BGRX layout, with the top byte ignored.
+    /// Rows therefore copy with one `memcpy` instead of a per-pixel conversion.
+    fn pixels_as_bytes_mut(pixels: &mut [u32]) -> &mut [u8] {
+        const _: () = assert!(cfg!(target_endian = "little"), "0RGB pixels assume LE");
+        // SAFETY: `u32` has no padding and no invalid bit patterns, and its
+        // alignment is stricter than `u8`'s, so the same memory is a valid
+        // `[u8]` four times as long, for the same lifetime.
+        unsafe {
+            std::slice::from_raw_parts_mut(pixels.as_mut_ptr().cast::<u8>(), pixels.len() * 4)
+        }
+    }
+
+    /// Per-second counters printed when `MSB_DISPLAY_STATS=1`.
+    struct Stats {
+        since: Instant,
+        frames: u64,
+        redraws: u64,
+        bytes: u64,
+        draw: Duration,
+    }
+
+    impl Stats {
+        fn new() -> Stats {
+            Stats {
+                since: Instant::now(),
+                frames: 0,
+                redraws: 0,
+                bytes: 0,
+                draw: Duration::ZERO,
+            }
+        }
+
+        /// Print and reset once a second has passed.
+        fn tick(&mut self) {
+            let elapsed = self.since.elapsed();
+            if elapsed < Duration::from_secs(1) {
+                return;
+            }
+            let secs = elapsed.as_secs_f64();
+            let per_redraw = if self.redraws == 0 {
+                0.0
+            } else {
+                self.draw.as_secs_f64() * 1e3 / self.redraws as f64
+            };
+            eprintln!(
+                "stats: {:.1} frames/s, {:.1} redraws/s, {:.1} MB/s copied, {per_redraw:.2} ms/redraw",
+                self.frames as f64 / secs,
+                self.redraws as f64 / secs,
+                self.bytes as f64 / secs / 1e6,
+            );
+            *self = Stats::new();
+        }
     }
 
     struct Sender(Mutex<UnixStream>);
@@ -90,6 +305,10 @@ mod macos {
         surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
         scanout: Option<Scanout>,
         wheel_carry: (f32, f32),
+        /// Damage accumulated since the last redraw; `None` means the back
+        /// buffer already matches the newest frame.
+        pending: Option<Damage>,
+        stats: Option<Stats>,
     }
 
     impl App {
@@ -111,13 +330,23 @@ mod macos {
             };
             let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
             let surface = softbuffer::Surface::new(&context, window.clone()).expect("surface");
+            let size = window.inner_size();
+            eprintln!(
+                "window: {}x{} physical, scale {}",
+                size.width,
+                size.height,
+                window.scale_factor()
+            );
             self.window = Some(window);
             self.surface = Some(surface);
         }
 
         fn redraw(&mut self) {
-            let (Some(window), Some(surface), Some(scanout)) =
-                (&self.window, &mut self.surface, &self.scanout)
+            let started = Instant::now();
+            let Some(window) = self.window.as_ref() else {
+                return;
+            };
+            let (Some(surface), Some(scanout)) = (self.surface.as_mut(), self.scanout.as_mut())
             else {
                 return;
             };
@@ -129,30 +358,34 @@ mod macos {
             if surface.resize(w, h).is_err() {
                 return;
             }
-            let Ok(mut buffer) = surface.buffer_mut() else { return };
-            let start = scanout.slot * scanout.frame_size;
-            let src = &scanout.mmap[start..start + scanout.frame_size];
+            // Only the damaged rows of the fresh slot reach the back buffer.
+            // The damage is taken only here, once the redraw is certain to
+            // apply it: an earlier bail-out would lose it for good and leave
+            // the back buffer stale in that rectangle.
+            let bytes = scanout.absorb(self.pending.take());
+            // softbuffer's macOS surface buffer does not persist: `buffer_mut`
+            // hands out a fresh zeroed `Vec` and `present` moves it into a
+            // `CGDataProvider` (cg.rs:261, 298), so the whole back buffer has
+            // to be blitted every redraw. `present_with_damage` would not help
+            // either — it ignores the damage (cg.rs:364).
+            let Ok(mut buffer) = surface.buffer_mut() else {
+                return;
+            };
             let (sw, sh) = (scanout.width as usize, scanout.height as usize);
             let (dw, dh) = (size.width as usize, size.height as usize);
-            if (sw, sh) == (dw, dh) {
-                for (dst, px) in buffer.iter_mut().zip(src.chunks_exact(4)) {
-                    *dst = u32::from_le_bytes([px[0], px[1], px[2], 0]);
-                }
+            if (sw, sh) == (dw, dh) && buffer.len() == scanout.back.len() {
+                buffer.copy_from_slice(&scanout.back);
             } else {
-                // Nearest-neighbour scale; the window is usually the scanout
-                // size or its HiDPI multiple.
-                for y in 0..dh {
-                    let sy = y * sh / dh;
-                    let row = &src[sy * sw * 4..(sy + 1) * sw * 4];
-                    let out = &mut buffer[y * dw..(y + 1) * dw];
-                    for (x, dst) in out.iter_mut().enumerate() {
-                        let sx = x * sw / dw;
-                        let px = &row[sx * 4..sx * 4 + 4];
-                        *dst = u32::from_le_bytes([px[0], px[1], px[2], 0]);
-                    }
-                }
+                let Scanout { back, scaler, .. } = scanout;
+                scaler.scale_into(back, (sw, sh), &mut buffer, (dw, dh));
             }
             let _ = buffer.present();
+            if let Some(stats) = self.stats.as_mut() {
+                stats.redraws += 1;
+                stats.bytes += bytes as u64;
+                stats.draw += started.elapsed();
+                stats.tick();
+            }
         }
 
         fn pointer_abs(&self, x: f64, y: f64) -> Option<(u32, u32)> {
@@ -202,18 +435,38 @@ mod macos {
                         frame_size,
                         mmap,
                         slot: 0,
+                        back: vec![0; width as usize * height as usize],
+                        scaler: Scaler::default(),
                     });
+                    // The back buffer starts empty, so the first redraw must
+                    // read the whole slot.
+                    self.pending = Some(Damage::Full);
                     self.ensure_window(event_loop, width, height);
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
                 }
-                UserEvent::Server(ServerMsg::Frame { scanout, slot, .. }) => {
+                UserEvent::Server(ServerMsg::Frame {
+                    scanout,
+                    slot,
+                    rect,
+                    ..
+                }) => {
                     if scanout != SCANOUT {
                         return;
                     }
-                    if let Some(s) = &mut self.scanout {
-                        s.slot = slot as usize;
+                    let Some(s) = &mut self.scanout else { return };
+                    s.slot = slot as usize;
+                    let damage = rect
+                        .and_then(|r| Rect::clip(r, s.width, s.height))
+                        .map_or(Damage::Full, Damage::Part);
+                    self.pending = Some(match self.pending {
+                        Some(prev) => prev.merge(damage),
+                        None => damage,
+                    });
+                    if let Some(stats) = self.stats.as_mut() {
+                        stats.frames += 1;
+                        stats.tick();
                     }
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -222,6 +475,7 @@ mod macos {
                 UserEvent::Server(ServerMsg::Disable { scanout }) => {
                     if scanout == SCANOUT {
                         self.scanout = None;
+                        self.pending = None;
                     }
                 }
                 UserEvent::Disconnected => {
@@ -231,7 +485,12 @@ mod macos {
             }
         }
 
-        fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        fn window_event(
+            &mut self,
+            event_loop: &ActiveEventLoop,
+            _id: WindowId,
+            event: WindowEvent,
+        ) {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
                 WindowEvent::RedrawRequested => self.redraw(),
@@ -244,8 +503,12 @@ mod macos {
                     if event.repeat {
                         return;
                     }
-                    let PhysicalKey::Code(code) = event.physical_key else { return };
-                    let Some(code) = keycode_to_evdev(code) else { return };
+                    let PhysicalKey::Code(code) = event.physical_key else {
+                        return;
+                    };
+                    let Some(code) = keycode_to_evdev(code) else {
+                        return;
+                    };
                     self.sender.send(&ViewerMsg::Key {
                         code,
                         down: event.state == ElementState::Pressed,
@@ -338,6 +601,10 @@ mod macos {
             surface: None,
             scanout: None,
             wheel_carry: (0.0, 0.0),
+            pending: None,
+            stats: std::env::var_os(STATS_ENV)
+                .is_some_and(|v| v == "1")
+                .then(Stats::new),
         };
         event_loop
             .run_app(&mut app)
@@ -459,5 +726,143 @@ mod macos {
             ContextMenu => KEY_COMPOSE,
             _ => return None,
         })
+    }
+
+    //--------------------------------------------------------------------------------------------------
+    // Tests
+    //--------------------------------------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A `w` x `h` BGRX frame whose pixels encode their coordinates.
+        fn frame(w: usize, h: usize, tag: u8) -> Vec<u8> {
+            (0..w * h)
+                .flat_map(|i| {
+                    let (x, y) = ((i % w) as u8, (i / w) as u8);
+                    [x, y, tag, 0]
+                })
+                .collect()
+        }
+
+        fn pixel(x: u8, y: u8, tag: u8) -> u32 {
+            u32::from_le_bytes([x, y, tag, 0])
+        }
+
+        #[test]
+        fn clip_rejects_out_of_bounds_and_empty_rects() {
+            assert!(Rect::clip([10, 10, 4, 4], 8, 8).is_none());
+            assert!(Rect::clip([0, 0, 0, 4], 8, 8).is_none());
+            let r = Rect::clip([6, 6, 100, 100], 8, 8).expect("clipped to the scanout");
+            assert_eq!((r.x, r.y, r.w, r.h), (6, 6, 2, 2));
+        }
+
+        #[test]
+        fn merge_takes_the_bounding_box_and_full_wins() {
+            let a = Rect {
+                x: 1,
+                y: 2,
+                w: 2,
+                h: 2,
+            };
+            let b = Rect {
+                x: 5,
+                y: 1,
+                w: 1,
+                h: 6,
+            };
+            let Damage::Part(u) = Damage::Part(a).merge(Damage::Part(b)) else {
+                panic!("two rectangles merge into a rectangle");
+            };
+            assert_eq!((u.x, u.y, u.w, u.h), (1, 1, 5, 6));
+            assert!(matches!(Damage::Part(a).merge(Damage::Full), Damage::Full));
+        }
+
+        #[test]
+        fn copy_rect_touches_only_the_damaged_pixels() {
+            let (w, h) = (8usize, 6usize);
+            let mut back = vec![0u32; w * h];
+            assert_eq!(
+                copy_rect(
+                    &mut back,
+                    &frame(w, h, 1),
+                    w,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 8,
+                        h: 6
+                    }
+                ),
+                w * h * 4
+            );
+            // A second frame damages a 3x2 rectangle; the rest must survive.
+            let bytes = copy_rect(
+                &mut back,
+                &frame(w, h, 2),
+                w,
+                Rect {
+                    x: 2,
+                    y: 1,
+                    w: 3,
+                    h: 2,
+                },
+            );
+            assert_eq!(bytes, 3 * 2 * 4);
+            for y in 0..h {
+                for x in 0..w {
+                    let inside = (2..5).contains(&x) && (1..3).contains(&y);
+                    let tag = if inside { 2 } else { 1 };
+                    assert_eq!(back[y * w + x], pixel(x as u8, y as u8, tag), "at {x},{y}");
+                }
+            }
+        }
+
+        #[test]
+        fn integer_scale_duplicates_pixels_and_rows() {
+            let (sw, sh) = (3usize, 2usize);
+            let src: Vec<u32> = (0..sw * sh).map(|i| i as u32).collect();
+            let (dw, dh) = (sw * 2, sh * 2);
+            let mut dst = vec![u32::MAX; dw * dh];
+            Scaler::default().scale_into(&src, (sw, sh), &mut dst, (dw, dh));
+            #[rustfmt::skip]
+            let want = vec![
+                0, 0, 1, 1, 2, 2,
+                0, 0, 1, 1, 2, 2,
+                3, 3, 4, 4, 5, 5,
+                3, 3, 4, 4, 5, 5,
+            ];
+            assert_eq!(dst, want);
+        }
+
+        #[test]
+        fn non_integer_scale_matches_nearest_neighbour() {
+            let (sw, sh) = (4usize, 3usize);
+            let src: Vec<u32> = (0..sw * sh).map(|i| i as u32).collect();
+            let (dw, dh) = (7usize, 5usize);
+            let mut dst = vec![u32::MAX; dw * dh];
+            let mut scaler = Scaler::default();
+            scaler.scale_into(&src, (sw, sh), &mut dst, (dw, dh));
+            for y in 0..dh {
+                for x in 0..dw {
+                    let want = src[(y * sh / dh) * sw + x * sw / dw];
+                    assert_eq!(dst[y * dw + x], want, "at {x},{y}");
+                }
+            }
+            // The cached table is reused for the same (source, destination).
+            assert_eq!(scaler.built_for, (sw, dw));
+            let mut again = vec![u32::MAX; dw * dh];
+            scaler.scale_into(&src, (sw, sh), &mut again, (dw, dh));
+            assert_eq!(again, dst);
+        }
+
+        #[test]
+        fn scale_into_ignores_buffers_that_are_too_small() {
+            let src = vec![7u32; 4];
+            let mut dst = vec![0u32; 3];
+            Scaler::default().scale_into(&src, (2, 2), &mut dst, (2, 2));
+            assert_eq!(dst, vec![0, 0, 0]);
+        }
     }
 }
