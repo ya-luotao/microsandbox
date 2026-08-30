@@ -53,6 +53,12 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Stora
 [target.'cfg(unix)'.dependencies]
 microsandbox-agent-client = { workspace = true, features = ["uds"] }
 
+# virtio-snd's only host audio backend is cpal/CoreAudio; on Linux the feature
+# would pull in the PipeWire client library at build time. Keeping `snd` in a
+# macOS-only table means Cargo activates it only when building for macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+msb_krun = { workspace = true, features = ["snd"] }
+
 [target.'cfg(windows)'.dependencies.microsandbox-agent-client]
 workspace = true
 features = ["named-pipe"]

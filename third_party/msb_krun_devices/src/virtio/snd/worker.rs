@@ -26,6 +26,24 @@ use crate::virtio::snd::stream::Buffer;
 use crate::virtio::snd::{ControlMessageKind, IOMessage};
 use crate::virtio::{DescriptorChain, InterruptTransport};
 
+/// Maps a backend error onto the status code the guest driver expects.
+///
+/// Every control message answers with a status; a backend failure must never
+/// escape as a panic, because the worker thread carries every virtqueue for the
+/// device and the guest driver would hang on the next request.
+fn error_status(err: &Error) -> u32 {
+    match err {
+        Error::Stream(_) | Error::StreamWithIdNotFound(_) => VIRTIO_SND_S_BAD_MSG,
+        Error::UnexpectedAudioBackendConfiguration | Error::ChannelNotSupported(_) => {
+            VIRTIO_SND_S_NOT_SUPP
+        }
+        _ => {
+            log::error!("{err}");
+            VIRTIO_SND_S_IO_ERR
+        }
+    }
+}
+
 pub struct SndWorker {
     vrings: Vec<Arc<Mutex<Vring>>>,
     queue_events: Vec<Arc<EventFd>>,
@@ -81,7 +99,7 @@ impl SndWorker {
         let chmaps: Arc<RwLock<Vec<VirtioSoundChmapInfo>>> = Arc::new(RwLock::new(chmaps_info));
 
         let audio_backend =
-            RwLock::new(alloc_audio_backend(BackendType::Pipewire, streams.clone()).unwrap());
+            RwLock::new(alloc_audio_backend(BackendType::default(), streams.clone()).unwrap());
 
         let mut vrings: Vec<Arc<Mutex<Vring>>> = Vec::new();
         let mut queue_events: Vec<Arc<EventFd>> = Vec::new();
@@ -410,18 +428,7 @@ impl SndWorker {
                     .unwrap()
                     .set_parameters(stream_id, request)
                 {
-                    match err {
-                        Error::Stream(_) | Error::StreamWithIdNotFound(_) => {
-                            resp.code = VIRTIO_SND_S_BAD_MSG.into()
-                        }
-                        Error::UnexpectedAudioBackendConfiguration => {
-                            resp.code = VIRTIO_SND_S_NOT_SUPP.into()
-                        }
-                        _ => {
-                            log::error!("{err}");
-                            resp.code = VIRTIO_SND_S_IO_ERR.into()
-                        }
-                    }
+                    resp.code = error_status(&err).into();
                 }
             }
             ControlMessageKind::PcmPrepare => {
@@ -434,12 +441,8 @@ impl SndWorker {
                 if stream_id as usize >= self.streams_no {
                     log::error!("{}", Error::from(StreamError::InvalidStreamId(stream_id)));
                     resp.code = VIRTIO_SND_S_BAD_MSG.into();
-                } else {
-                    self.audio_backend
-                        .write()
-                        .unwrap()
-                        .prepare(stream_id)
-                        .unwrap();
+                } else if let Err(err) = self.audio_backend.write().unwrap().prepare(stream_id) {
+                    resp.code = error_status(&err).into();
                 }
             }
             ControlMessageKind::PcmRelease => {
@@ -453,15 +456,7 @@ impl SndWorker {
                     log::error!("{}", Error::from(StreamError::InvalidStreamId(stream_id)));
                     resp.code = VIRTIO_SND_S_BAD_MSG.into();
                 } else if let Err(err) = self.audio_backend.write().unwrap().release(stream_id) {
-                    match err {
-                        Error::Stream(_) | Error::StreamWithIdNotFound(_) => {
-                            resp.code = VIRTIO_SND_S_BAD_MSG.into()
-                        }
-                        _ => {
-                            log::error!("{err}");
-                            resp.code = VIRTIO_SND_S_IO_ERR.into()
-                        }
-                    }
+                    resp.code = error_status(&err).into();
                 }
             }
             ControlMessageKind::PcmStart => {
@@ -474,12 +469,8 @@ impl SndWorker {
                 if stream_id as usize >= self.streams_no {
                     log::error!("{}", Error::from(StreamError::InvalidStreamId(stream_id)));
                     resp.code = VIRTIO_SND_S_BAD_MSG.into();
-                } else {
-                    self.audio_backend
-                        .write()
-                        .unwrap()
-                        .start(stream_id)
-                        .unwrap();
+                } else if let Err(err) = self.audio_backend.write().unwrap().start(stream_id) {
+                    resp.code = error_status(&err).into();
                 }
             }
             ControlMessageKind::PcmStop => {
@@ -492,8 +483,8 @@ impl SndWorker {
                 if stream_id as usize >= self.streams_no {
                     log::error!("{}", Error::from(StreamError::InvalidStreamId(stream_id)));
                     resp.code = VIRTIO_SND_S_BAD_MSG.into();
-                } else {
-                    self.audio_backend.write().unwrap().stop(stream_id).unwrap();
+                } else if let Err(err) = self.audio_backend.write().unwrap().stop(stream_id) {
+                    resp.code = error_status(&err).into();
                 }
             }
         }
@@ -639,7 +630,9 @@ impl SndWorker {
         if !stream_ids.is_empty() {
             let b = self.audio_backend.read().unwrap();
             for id in stream_ids {
-                b.write(id).unwrap();
+                if let Err(err) = b.write(id) {
+                    log::error!("stream {id}: audio backend rejected the transfer: {err}");
+                }
             }
         }
 
