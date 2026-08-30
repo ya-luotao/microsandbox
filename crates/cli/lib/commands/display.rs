@@ -312,6 +312,12 @@ mod macos {
             }
         }
 
+        fn set_host_cursor_visible(&self, visible: bool) {
+            if let Some(window) = &self.window {
+                window.set_cursor_visible(visible);
+            }
+        }
+
         fn pointer_abs(&self, x: f64, y: f64) -> Option<(u32, u32)> {
             let size = self.window.as_ref()?.inner_size();
             if size.width == 0 || size.height == 0 {
@@ -390,6 +396,7 @@ mod macos {
                 UserEvent::Server(ServerMsg::Disable { scanout }) => {
                     if scanout == SCANOUT {
                         self.scanout = None;
+                        self.set_host_cursor_visible(true);
                     }
                 }
                 UserEvent::Disconnected => {
@@ -432,6 +439,18 @@ mod macos {
                     if let Some((x, y)) = self.pointer_abs(position.x, position.y) {
                         self.sender.send(&ViewerMsg::Abs { x, y });
                     }
+                }
+                // The guest draws its own cursor at the pointer position it
+                // receives, so the macOS cursor would sit on top of it as a
+                // second arrow. Hide it while the pointer is over a live
+                // scanout; a window without a scanout keeps the host cursor.
+                WindowEvent::CursorEntered { .. } => {
+                    self.set_host_cursor_visible(self.scanout.is_none());
+                }
+                // winit keeps the cursor hidden while the window is focused
+                // even once the pointer has left it, so restore it explicitly.
+                WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false) => {
+                    self.set_host_cursor_visible(true);
                 }
                 WindowEvent::MouseInput { state, button, .. } => {
                     let code = match button {
