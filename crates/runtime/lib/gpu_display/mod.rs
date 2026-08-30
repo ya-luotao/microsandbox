@@ -18,10 +18,11 @@
 //! answered once it returns, and the same holds for the cursor methods. So the
 //! gpu worker never touches the socket — it queues onto a bounded channel that
 //! a per-connection writer thread drains. A viewer that stops reading fills the
-//! queue and its messages are dropped rather than blocking the guest: a dropped
-//! frame is superseded by the next one, and a dropped cursor image is re-sent
-//! once the writer catches up, so the viewer is never left showing a stale
-//! cursor.
+//! queue and its messages are dropped rather than blocking the guest. A dropped
+//! frame is superseded by the next one and a dropped clipboard is recoverable
+//! from the backend, but a dropped `Configure`/`Disable` or cursor image would
+//! leave the viewer acting on a scanout or a cursor that no longer exists, so
+//! the writer replays the current state of those once it catches up.
 
 pub mod clipboard;
 pub mod dump;
@@ -34,7 +35,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -62,6 +63,40 @@ use protocol::{ServerMsg, ViewerMsg, SLOTS};
 /// absorbs that; 256 messages is a few frames' worth of slack.
 const VIEWER_QUEUE: usize = 256;
 
+/// State a viewer must be told again after its queue overflowed.
+///
+/// Most dropped messages need no follow-up: a `Frame` is superseded by the next
+/// one, and a `Clipboard` is recoverable from the backend's `last_guest`. These
+/// two are not — the viewer would be left acting on a scanout or a cursor that
+/// no longer exists.
+#[derive(Default)]
+struct Dirty {
+    /// Scanouts whose `Configure` or `Disable` was dropped, as a bitmask.
+    ///
+    /// Losing one is not cosmetic: the viewer mmaps the scanout's frame file at
+    /// the size the last `Configure` gave it, and `configure_scanout` truncates
+    /// and reopens the same path. A mode shrink whose `Configure` was dropped
+    /// leaves the viewer reading past the new end of file, which is a SIGBUS.
+    config: AtomicU64,
+    /// A cursor image was dropped; the viewer would keep showing a stale one.
+    cursor: AtomicBool,
+}
+
+impl Dirty {
+    /// Note that `dropped` never reached the viewer.
+    fn mark(&self, dropped: &ServerMsg) {
+        match *dropped {
+            ServerMsg::Configure { scanout, .. } | ServerMsg::Disable { scanout } => {
+                if scanout < MAX_DISPLAYS as u32 {
+                    self.config.fetch_or(1 << scanout, Ordering::Relaxed);
+                }
+            }
+            ServerMsg::Cursor { .. } => self.cursor.store(true, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+}
+
 /// A viewer connection; only one is served at a time.
 ///
 /// The socket is owned by a writer thread, so nothing the gpu worker does can
@@ -69,10 +104,7 @@ const VIEWER_QUEUE: usize = 256;
 struct Viewer {
     id: u64,
     tx: SyncSender<ServerMsg>,
-    /// A cursor image was dropped because the queue was full. The viewer would
-    /// otherwise keep showing a stale cursor, so the writer re-sends the latest
-    /// one once it has caught up.
-    dirty_cursor: Arc<AtomicBool>,
+    dirty: Arc<Dirty>,
 }
 
 struct ScanoutInfo {
@@ -107,11 +139,7 @@ impl Shared {
         match viewer.tx.try_send(msg) {
             Ok(()) => {}
             Err(TrySendError::Full(dropped)) => {
-                // A dropped frame is superseded by the next one; a dropped
-                // cursor is not, so remember to re-send the latest image.
-                if matches!(dropped, ServerMsg::Cursor { .. }) {
-                    viewer.dirty_cursor.store(true, Ordering::Relaxed);
-                }
+                viewer.dirty.mark(&dropped);
                 tracing::debug!(
                     viewer = viewer.id,
                     "gpu display: viewer queue full, dropping"
@@ -132,18 +160,18 @@ impl Shared {
         // A stalled viewer must not stall its writer thread forever either.
         let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
         let (tx, rx) = sync_channel(VIEWER_QUEUE);
-        let dirty_cursor = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(Dirty::default());
         {
             let mut guard = self.viewer.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(Viewer {
                 id,
                 tx,
-                dirty_cursor: Arc::clone(&dirty_cursor),
+                dirty: Arc::clone(&dirty),
             });
         }
         if let Err(e) = std::thread::Builder::new()
             .name(format!("gpu display writer {id}"))
-            .spawn(move || writer_loop(self, id, stream, rx, dirty_cursor))
+            .spawn(move || writer_loop(self, id, stream, rx, dirty))
         {
             tracing::warn!(error = %e, "gpu display: writer thread failed");
             self.detach(id);
@@ -315,13 +343,47 @@ fn accept_loop(shared: &'static Shared, listener: UnixListener) {
     }
 }
 
+/// What a viewer must be re-sent after its queue overflowed: the current state
+/// of every scanout whose `Configure`/`Disable` was dropped, then the latest
+/// cursor images. Config first — a cursor means nothing to a viewer that has
+/// the wrong idea of the scanout it belongs to.
+///
+/// The state is read now rather than replaying what was dropped, so a scanout
+/// that changed twice while the queue was full still lands on its real size.
+fn overflow_replay(
+    dirty: &Dirty,
+    scanouts: &Mutex<Vec<Option<ScanoutInfo>>>,
+    cursors: &Mutex<Vec<Option<ServerMsg>>>,
+) -> Vec<ServerMsg> {
+    let mut replay = Vec::new();
+    let config = dirty.config.swap(0, Ordering::Relaxed);
+    if config != 0 {
+        let scanouts = scanouts.lock().unwrap_or_else(|e| e.into_inner());
+        for (scanout, info) in scanouts.iter().enumerate() {
+            if config & (1 << scanout) == 0 {
+                continue;
+            }
+            let scanout = scanout as u32;
+            replay.push(match info {
+                Some(info) => configure_msg(scanout, info),
+                None => ServerMsg::Disable { scanout },
+            });
+        }
+    }
+    if dirty.cursor.swap(false, Ordering::Relaxed) {
+        let cursors = cursors.lock().unwrap_or_else(|e| e.into_inner());
+        replay.extend(cursors.iter().flatten().cloned());
+    }
+    replay
+}
+
 /// Owns the viewer's socket so no write ever happens on the gpu worker thread.
 fn writer_loop(
     shared: &'static Shared,
     id: u64,
     mut stream: UnixStream,
     rx: Receiver<ServerMsg>,
-    dirty_cursor: Arc<AtomicBool>,
+    dirty: Arc<Dirty>,
 ) {
     fn write_msg(stream: &mut UnixStream, msg: &ServerMsg) -> io::Result<()> {
         let mut line = serde_json::to_vec(msg).expect("protocol messages serialize");
@@ -334,14 +396,12 @@ fn writer_loop(
             tracing::info!(viewer = id, error = %e, "gpu display: dropping viewer");
             break;
         }
-        // Caught up after dropping one or more cursor images: the viewer must
-        // not be left showing a stale cursor.
-        if dirty_cursor.swap(false, Ordering::Relaxed) {
-            for cursor in shared.latest_cursors() {
-                if let Err(e) = write_msg(&mut stream, &cursor) {
-                    tracing::info!(viewer = id, error = %e, "gpu display: dropping viewer");
-                    return shared.detach(id);
-                }
+        // Caught up after dropping something the viewer cannot recover on its
+        // own; put it back in step before carrying on.
+        for msg in overflow_replay(&dirty, &shared.scanouts, &shared.cursors) {
+            if let Err(e) = write_msg(&mut stream, &msg) {
+                tracing::info!(viewer = id, error = %e, "gpu display: dropping viewer");
+                return shared.detach(id);
             }
         }
     }
@@ -746,32 +806,110 @@ mod tests {
         }
     }
 
+    fn scanout_info(width: u32, height: u32) -> ScanoutInfo {
+        ScanoutInfo {
+            width,
+            height,
+            format: "BGRX".to_string(),
+            path: PathBuf::from("/tmp/scanout0.fb"),
+        }
+    }
+
     /// A viewer that stops reading must not stall the gpu worker, and must not
-    /// be left showing a cursor that was dropped on the way.
+    /// be left acting on state that was dropped on the way.
     #[test]
-    fn a_dropped_cursor_is_resent_once_the_viewer_catches_up() {
+    fn a_full_queue_drops_rather_than_blocking() {
         let (tx, rx) = sync_channel::<ServerMsg>(1);
-        let dirty = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(Dirty::default());
         let viewer = Viewer {
             id: 1,
             tx,
-            dirty_cursor: Arc::clone(&dirty),
+            dirty: Arc::clone(&dirty),
         };
 
         // One message fits; everything after it is dropped rather than blocking.
         assert!(matches!(viewer.tx.try_send(cursor_msg(0, "first")), Ok(())));
-        let stale = viewer.tx.try_send(cursor_msg(0, "second"));
-        let Err(TrySendError::Full(dropped)) = stale else {
+        let Err(TrySendError::Full(dropped)) = viewer.tx.try_send(cursor_msg(0, "second")) else {
             panic!("expected a full queue");
         };
-        // This is the branch `Shared::send` takes for a dropped cursor.
-        assert!(matches!(dropped, ServerMsg::Cursor { .. }));
-        dirty.store(true, Ordering::Relaxed);
-
-        // The writer drains, notices the flag, and re-sends the latest image.
+        // This is what `Shared::send` does with the message it could not queue.
+        viewer.dirty.mark(&dropped);
+        assert!(dirty.cursor.load(Ordering::Relaxed));
         assert!(matches!(rx.recv(), Ok(ServerMsg::Cursor { .. })));
-        assert!(dirty.swap(false, Ordering::Relaxed));
-        assert!(!dirty.load(Ordering::Relaxed));
+    }
+
+    /// A dropped `Configure` is the dangerous one: the viewer mmaps the frame
+    /// file at the size it last heard, and `configure_scanout` truncates and
+    /// reopens the same path, so a mode shrink it missed is a SIGBUS.
+    #[test]
+    fn a_dropped_configure_is_replayed_from_current_state() {
+        let dirty = Dirty::default();
+        let scanouts = Mutex::new(vec![Some(scanout_info(1920, 1080)), None]);
+        let cursors: Mutex<Vec<Option<ServerMsg>>> = Mutex::new(vec![None, None]);
+
+        // Nothing was dropped, so there is nothing to put right.
+        assert!(overflow_replay(&dirty, &scanouts, &cursors).is_empty());
+
+        // The guest shrank the mode while the viewer was behind, and the
+        // Configure never made it. The replay carries the size it is at *now*,
+        // not the one that was dropped.
+        dirty.mark(&configure_msg(0, &scanout_info(1280, 720)));
+        *scanouts.lock().unwrap() = vec![Some(scanout_info(800, 600)), None];
+        let replay = overflow_replay(&dirty, &scanouts, &cursors);
+        assert!(
+            matches!(
+                replay.as_slice(),
+                [ServerMsg::Configure {
+                    scanout: 0,
+                    width: 800,
+                    height: 600,
+                    ..
+                }]
+            ),
+            "got {replay:?}"
+        );
+        // The flag is consumed, so a caught-up viewer is not spammed.
+        assert!(overflow_replay(&dirty, &scanouts, &cursors).is_empty());
+
+        // A scanout the guest has since turned off replays the disable, not a
+        // stale size.
+        dirty.mark(&configure_msg(1, &scanout_info(640, 480)));
+        assert!(matches!(
+            overflow_replay(&dirty, &scanouts, &cursors).as_slice(),
+            [ServerMsg::Disable { scanout: 1 }]
+        ));
+
+        // Config comes before the cursor: a cursor means nothing to a viewer
+        // that has the wrong idea of the scanout it belongs to.
+        *cursors.lock().unwrap() = vec![Some(cursor_msg(0, "img")), None];
+        dirty.mark(&ServerMsg::Disable { scanout: 0 });
+        dirty.mark(&cursor_msg(0, "dropped"));
+        assert!(matches!(
+            overflow_replay(&dirty, &scanouts, &cursors).as_slice(),
+            [
+                ServerMsg::Configure { scanout: 0, .. },
+                ServerMsg::Cursor { scanout: 0, .. }
+            ]
+        ));
+    }
+
+    /// A dropped frame is superseded by the next one, and a dropped clipboard
+    /// is recoverable from the backend's `last_guest`.
+    #[test]
+    fn dropped_frames_and_clipboard_need_no_replay() {
+        let dirty = Dirty::default();
+        dirty.mark(&ServerMsg::Frame {
+            scanout: 0,
+            slot: 0,
+            seq: 1,
+            rect: None,
+        });
+        dirty.mark(&ServerMsg::Clipboard {
+            mime: protocol::TEXT_MIME.to_string(),
+            data: String::new(),
+        });
+        assert_eq!(dirty.config.load(Ordering::Relaxed), 0);
+        assert!(!dirty.cursor.load(Ordering::Relaxed));
     }
 
     /// The same image again is not worth ~22 KB of base64 on the wire.
