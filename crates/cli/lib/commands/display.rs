@@ -10,6 +10,9 @@
 use clap::Args;
 
 /// Open a native window on a running sandbox's display.
+///
+/// Clipboard text is kept in sync with the Mac pasteboard while the window is
+/// open. Set `MSB_DISPLAY_CLIPBOARD=0` to turn that off in both directions.
 #[derive(Debug, Args)]
 pub struct DisplayArgs {
     /// Sandbox whose display to show.
@@ -64,6 +67,18 @@ mod macos {
 
     /// Set `MSB_DISPLAY_STATS=1` for a one-line frame/copy summary per second.
     const STATS_ENV: &str = "MSB_DISPLAY_STATS";
+
+    /// Clipboard sync is on unless this is set to something other than `1`.
+    ///
+    /// The pasteboard is pushed into the sandbox whenever the window takes
+    /// focus or a key is pressed, and the guest can replace what the Mac
+    /// holds, so an untrusted image needs a way to opt out of both.
+    const CLIPBOARD_ENV: &str = "MSB_DISPLAY_CLIPBOARD";
+
+    /// Whether to sync the clipboard at all.
+    fn clipboard_enabled() -> bool {
+        std::env::var_os(CLIPBOARD_ENV).is_none_or(|v| v == "1")
+    }
 
     enum UserEvent {
         Server(ServerMsg),
@@ -296,6 +311,10 @@ mod macos {
 
         /// Put the guest's selection on the Mac pasteboard.
         fn apply_guest_clipboard(&mut self, mime: String, data: String) {
+            // Disabled, or no pasteboard: drop it without even decoding.
+            if self.clipboard.is_none() {
+                return;
+            }
             if !mime.starts_with("text/plain") {
                 if self.warned_mimes.insert(mime.clone()) {
                     eprintln!("warning: ignoring clipboard type {mime}");
@@ -590,9 +609,10 @@ mod macos {
             stats: std::env::var_os(STATS_ENV)
                 .is_some_and(|v| v == "1")
                 .then(Stats::new),
-            clipboard: match arboard::Clipboard::new() {
-                Ok(clipboard) => Some(clipboard),
-                Err(e) => {
+            clipboard: match clipboard_enabled().then(arboard::Clipboard::new) {
+                None => None,
+                Some(Ok(clipboard)) => Some(clipboard),
+                Some(Err(e)) => {
                     eprintln!("warning: clipboard sync disabled: {e}");
                     None
                 }
