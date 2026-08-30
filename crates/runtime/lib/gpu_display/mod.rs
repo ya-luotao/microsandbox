@@ -10,8 +10,12 @@
 //!   virtio-input devices. `msb display <sandbox>` is that viewer.
 //! * [`dump::FrameDumpBackend`] keeps the latest frame on disk for debugging.
 //!
+//! A guest that drives the cursor plane also sends its pointer image and
+//! position through [`SharedFrameBackend`], which spares it a full scanout
+//! flush per pointer move.
+//!
 //! `present_frame` must never wait for a viewer: the guest's FLUSH is only
-//! answered once it returns.
+//! answered once it returns, and the same holds for the cursor methods.
 
 pub mod clipboard;
 pub mod dump;
@@ -25,10 +29,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use memmap2::{MmapMut, MmapOptions};
 use msb_krun::krun_display::{
-    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendError, DisplayBackendNew,
-    IntoDisplayBackend, Rect, ResourceFormat, MAX_DISPLAYS,
+    CursorImage, DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendCursor,
+    DisplayBackendError, DisplayBackendNew, IntoDisplayBackendWithCursor, Rect, ResourceFormat,
+    MAX_DISPLAYS,
 };
 use msb_krun::krun_input::{InputConfigBackend, InputEvent, InputEventProviderBackend};
 use msb_krun_utils::pollable_channel::PollableChannelSender;
@@ -62,6 +68,9 @@ struct Shared {
     keyboard_tx: PollableChannelSender<InputEvent>,
     pointer_tx: PollableChannelSender<InputEvent>,
     clipboard: Arc<ClipboardPortBackend>,
+    /// The latest [`ServerMsg::Cursor`] per scanout, so a viewer that attaches
+    /// after the guest set its cursor still gets the image.
+    cursors: Mutex<Vec<Option<ServerMsg>>>,
 }
 
 impl Shared {
@@ -93,6 +102,12 @@ impl Shared {
                 if let Some(info) = info {
                     self.send(&configure_msg(scanout as u32, info));
                 }
+            }
+        }
+        {
+            let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+            for msg in cursors.iter().flatten() {
+                self.send(msg);
             }
         }
         // A viewer that attached after the guest copied still gets that value.
@@ -168,6 +183,7 @@ impl DisplayServer {
             keyboard_tx: keyboard.tx.clone(),
             pointer_tx: pointer.tx.clone(),
             clipboard: Arc::clone(&clipboard),
+            cursors: Mutex::new((0..MAX_DISPLAYS).map(|_| None).collect()),
         }));
         // `Shared` had to exist first; the backend only forwards after this.
         clipboard.set_shared(shared);
@@ -187,7 +203,7 @@ impl DisplayServer {
 
     /// The display backend to hand to the VM builder.
     pub fn display_backend(&self) -> DisplayBackend<'static> {
-        SharedFrameBackend::into_display_backend(Some(self.shared))
+        SharedFrameBackend::into_display_backend_with_cursor(Some(self.shared))
     }
 
     /// The vsock backend serving the guest clipboard agent.
@@ -398,5 +414,143 @@ impl DisplayBackendBasicFramebuffer for SharedFrameBackend {
             rect: rect.map(|r| [r.x, r.y, r.width, r.height]),
         });
         Ok(())
+    }
+}
+
+/// The cursor image as RGBA8888, which is what the viewer's custom cursor
+/// wants.
+///
+/// virtio-gpu names a format by its bytes in memory order, so `BGRA` is
+/// `[b, g, r, a]`; the `X` variants carry no alpha and become opaque.
+fn to_rgba(format: ResourceFormat, data: &[u8]) -> Vec<u8> {
+    let (r, g, b, a) = match format {
+        ResourceFormat::BGRA => (2, 1, 0, Some(3)),
+        ResourceFormat::BGRX => (2, 1, 0, None),
+        ResourceFormat::ARGB => (1, 2, 3, Some(0)),
+        ResourceFormat::XRGB => (1, 2, 3, None),
+        ResourceFormat::RGBA => (0, 1, 2, Some(3)),
+        ResourceFormat::RGBX => (0, 1, 2, None),
+        ResourceFormat::ABGR => (3, 2, 1, Some(0)),
+        ResourceFormat::XBGR => (3, 2, 1, None),
+    };
+    data.chunks_exact(ResourceFormat::BYTES_PER_PIXEL)
+        .flat_map(|px| [px[r], px[g], px[b], a.map_or(0xff, |a| px[a])])
+        .collect()
+}
+
+/// The guest's cursor plane. `SharedFrameBackend` only forwards it; the viewer
+/// turns it into the window's cursor, so the pointer moves without the guest
+/// re-flushing the whole scanout.
+impl DisplayBackendCursor for SharedFrameBackend {
+    fn set_cursor(
+        &mut self,
+        scanout_id: u32,
+        image: Option<CursorImage<'_>>,
+    ) -> Result<(), DisplayBackendError> {
+        if scanout_id as usize >= self.frames.len() {
+            return Err(DisplayBackendError::InvalidScanoutId);
+        }
+        // An empty image is how the guest hides its cursor.
+        let msg = match image {
+            Some(image) => ServerMsg::Cursor {
+                scanout: scanout_id,
+                width: image.width,
+                height: image.height,
+                hot_x: image.hot_x,
+                hot_y: image.hot_y,
+                rgba: base64::engine::general_purpose::STANDARD
+                    .encode(to_rgba(image.format, image.data)),
+            },
+            None => ServerMsg::Cursor {
+                scanout: scanout_id,
+                width: 0,
+                height: 0,
+                hot_x: 0,
+                hot_y: 0,
+                rgba: String::new(),
+            },
+        };
+        {
+            let mut cursors = self.shared.cursors.lock().unwrap_or_else(|e| e.into_inner());
+            cursors[scanout_id as usize] = Some(msg.clone());
+        }
+        self.shared.send(&msg);
+        Ok(())
+    }
+
+    fn move_cursor(&mut self, scanout_id: u32, x: i32, y: i32) -> Result<(), DisplayBackendError> {
+        if scanout_id as usize >= self.frames.len() {
+            return Err(DisplayBackendError::InvalidScanoutId);
+        }
+        self.shared.send(&ServerMsg::CursorPos {
+            scanout: scanout_id,
+            x,
+            y,
+        });
+        Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One pixel whose bytes are distinguishable in every position.
+    const PIXEL: [u8; 4] = [0x10, 0x20, 0x30, 0x40];
+
+    #[test]
+    fn bgra_pixels_become_rgba() {
+        // [b, g, r, a] -> [r, g, b, a]
+        assert_eq!(
+            to_rgba(ResourceFormat::BGRA, &PIXEL),
+            vec![0x30, 0x20, 0x10, 0x40]
+        );
+        // [a, r, g, b] -> [r, g, b, a]
+        assert_eq!(
+            to_rgba(ResourceFormat::ARGB, &PIXEL),
+            vec![0x20, 0x30, 0x40, 0x10]
+        );
+        // [a, b, g, r] -> [r, g, b, a]
+        assert_eq!(
+            to_rgba(ResourceFormat::ABGR, &PIXEL),
+            vec![0x40, 0x30, 0x20, 0x10]
+        );
+        assert_eq!(to_rgba(ResourceFormat::RGBA, &PIXEL), PIXEL.to_vec());
+    }
+
+    #[test]
+    fn formats_without_alpha_are_opaque() {
+        assert_eq!(
+            to_rgba(ResourceFormat::BGRX, &PIXEL),
+            vec![0x30, 0x20, 0x10, 0xff]
+        );
+        assert_eq!(
+            to_rgba(ResourceFormat::XRGB, &PIXEL),
+            vec![0x20, 0x30, 0x40, 0xff]
+        );
+        assert_eq!(
+            to_rgba(ResourceFormat::RGBX, &PIXEL),
+            vec![0x10, 0x20, 0x30, 0xff]
+        );
+        assert_eq!(
+            to_rgba(ResourceFormat::XBGR, &PIXEL),
+            vec![0x40, 0x30, 0x20, 0xff]
+        );
+    }
+
+    #[test]
+    fn every_pixel_is_converted_and_a_short_tail_is_dropped() {
+        let mut data = PIXEL.to_vec();
+        data.extend_from_slice(&[1, 2, 3, 4]);
+        // A trailing partial pixel cannot be converted and is left out.
+        data.extend_from_slice(&[9, 9]);
+        assert_eq!(
+            to_rgba(ResourceFormat::BGRA, &data),
+            vec![0x30, 0x20, 0x10, 0x40, 3, 2, 1, 4]
+        );
     }
 }

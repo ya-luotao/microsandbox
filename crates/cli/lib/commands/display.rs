@@ -13,6 +13,11 @@ use clap::Args;
 ///
 /// Clipboard text is kept in sync with the Mac pasteboard while the window is
 /// open. Set `MSB_DISPLAY_CLIPBOARD=0` to turn that off in both directions.
+///
+/// A guest driving the virtio-gpu cursor plane has its pointer drawn as the
+/// window's own cursor, so moving the mouse costs no frames at all; a guest
+/// that renders its pointer into the scanout instead keeps the Mac's cursor
+/// hidden over the window.
 #[derive(Debug, Args)]
 pub struct DisplayArgs {
     /// Sandbox whose display to show.
@@ -41,7 +46,9 @@ pub fn run(args: DisplayArgs) -> ! {
 #[cfg(target_os = "macos")]
 mod macos {
     use std::collections::HashSet;
+    use std::collections::hash_map::DefaultHasher;
     use std::fs::File;
+    use std::hash::{Hash, Hasher};
     use std::io::{BufRead, BufReader, Write};
     use std::num::NonZeroU32;
     use std::os::unix::net::UnixStream;
@@ -60,7 +67,7 @@ mod macos {
     use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
     use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
     use winit::keyboard::{KeyCode, PhysicalKey};
-    use winit::window::{Window, WindowId};
+    use winit::window::{Cursor, CustomCursor, Window, WindowId};
 
     /// Only the first scanout is shown.
     const SCANOUT: u32 = 0;
@@ -83,6 +90,21 @@ mod macos {
     enum UserEvent {
         Server(ServerMsg),
         Disconnected,
+    }
+
+    /// What the guest's cursor plane last asked for.
+    ///
+    /// With a hardware cursor the host cursor *is* the guest's cursor: the
+    /// guest stops drawing its pointer into the scanout, so the window shows
+    /// the guest's image instead of hiding the Mac's own arrow.
+    enum GuestCursor {
+        /// No `Cursor` message yet — the guest renders its pointer into the
+        /// scanout, so the host cursor must stay hidden or there are two.
+        Software,
+        /// The guest hid its cursor.
+        Hidden,
+        /// The guest's cursor image.
+        Image(CustomCursor),
     }
 
     struct Scanout {
@@ -189,6 +211,9 @@ mod macos {
         redraws: u64,
         bytes: u64,
         draw: Duration,
+        /// Cursor plane updates: new images, then moves.
+        cursors: u64,
+        cursor_moves: u64,
     }
 
     impl Stats {
@@ -199,6 +224,8 @@ mod macos {
                 redraws: 0,
                 bytes: 0,
                 draw: Duration::ZERO,
+                cursors: 0,
+                cursor_moves: 0,
             }
         }
 
@@ -215,10 +242,13 @@ mod macos {
                 self.draw.as_secs_f64() * 1e3 / self.redraws as f64
             };
             eprintln!(
-                "stats: {:.1} frames/s, {:.1} redraws/s, {:.1} MB/s copied, {per_redraw:.2} ms/redraw",
+                "stats: {:.1} frames/s, {:.1} redraws/s, {:.1} MB/s copied, \
+                 {per_redraw:.2} ms/redraw, {:.1} cursors/s, {:.1} cursor moves/s",
                 self.frames as f64 / secs,
                 self.redraws as f64 / secs,
                 self.bytes as f64 / secs / 1e6,
+                self.cursors as f64 / secs,
+                self.cursor_moves as f64 / secs,
             );
             *self = Stats::new();
         }
@@ -251,6 +281,14 @@ mod macos {
         last_guest_text: Option<String>,
         /// MIME types already reported as unsupported.
         warned_mimes: HashSet<String>,
+        /// What the guest's cursor plane last asked for.
+        cursor: GuestCursor,
+        /// Hash of the image behind [`GuestCursor::Image`]: compositors re-send
+        /// the same cursor on some pointer paths, and rebuilding the
+        /// `CustomCursor` would allocate a new image every time.
+        cursor_hash: u64,
+        /// Whether the pointer is over the window.
+        pointer_inside: bool,
     }
 
     impl App {
@@ -395,10 +433,81 @@ mod macos {
             }
         }
 
-        fn set_host_cursor_visible(&self, visible: bool) {
-            if let Some(window) = &self.window {
-                window.set_cursor_visible(visible);
+        /// Reconcile the window's cursor with what the guest last asked for.
+        ///
+        /// Called on every change of the three inputs: the guest's cursor, the
+        /// scanout, and whether the pointer is over the window.
+        fn apply_cursor(&self) {
+            let Some(window) = &self.window else {
+                return;
+            };
+            // Away from a live scanout the Mac's own cursor is the user's.
+            if !self.pointer_inside || self.scanout.is_none() {
+                window.set_cursor(Cursor::default());
+                window.set_cursor_visible(true);
+                return;
             }
+            match &self.cursor {
+                // The guest already drew a pointer into the frame, or wants no
+                // cursor at all; either way the host must not add one.
+                GuestCursor::Software | GuestCursor::Hidden => window.set_cursor_visible(false),
+                GuestCursor::Image(cursor) => {
+                    window.set_cursor(cursor.clone());
+                    window.set_cursor_visible(true);
+                }
+            }
+        }
+
+        /// Take a new cursor image from the guest. An empty image hides it.
+        fn set_guest_cursor(
+            &mut self,
+            event_loop: &ActiveEventLoop,
+            width: u32,
+            height: u32,
+            hot_x: u32,
+            hot_y: u32,
+            rgba: &str,
+        ) {
+            if let Some(stats) = self.stats.as_mut() {
+                stats.cursors += 1;
+                stats.tick();
+            }
+            if width == 0 || height == 0 || rgba.is_empty() {
+                self.cursor = GuestCursor::Hidden;
+                self.cursor_hash = 0;
+                self.apply_cursor();
+                return;
+            }
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(rgba) else {
+                eprintln!("warning: bad cursor image from sandbox");
+                return;
+            };
+            let hash = hash_cursor(width, height, hot_x, hot_y, &bytes);
+            if hash == self.cursor_hash && matches!(self.cursor, GuestCursor::Image(_)) {
+                return;
+            }
+            // `from_rgba` rejects an oversized image, a byte count that does
+            // not match, and a hotspot outside the image, so the casts below
+            // are the only thing left to check.
+            let (Ok(width), Ok(height), Ok(hot_x), Ok(hot_y)) = (
+                u16::try_from(width),
+                u16::try_from(height),
+                u16::try_from(hot_x),
+                u16::try_from(hot_y),
+            ) else {
+                eprintln!("warning: cursor image {width}x{height} from sandbox is out of range");
+                return;
+            };
+            let source = match CustomCursor::from_rgba(bytes, width, height, hot_x, hot_y) {
+                Ok(source) => source,
+                Err(e) => {
+                    eprintln!("warning: cannot use the sandbox's cursor image: {e}");
+                    return;
+                }
+            };
+            self.cursor = GuestCursor::Image(event_loop.create_custom_cursor(source));
+            self.cursor_hash = hash;
+            self.apply_cursor();
         }
 
         fn pointer_abs(&self, x: f64, y: f64) -> Option<(u32, u32)> {
@@ -451,6 +560,7 @@ mod macos {
                         scaler: Scaler::default(),
                     });
                     self.ensure_window(event_loop, width, height);
+                    self.apply_cursor();
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -479,7 +589,32 @@ mod macos {
                 UserEvent::Server(ServerMsg::Disable { scanout }) => {
                     if scanout == SCANOUT {
                         self.scanout = None;
-                        self.set_host_cursor_visible(true);
+                        self.apply_cursor();
+                    }
+                }
+                UserEvent::Server(ServerMsg::Cursor {
+                    scanout,
+                    width,
+                    height,
+                    hot_x,
+                    hot_y,
+                    rgba,
+                }) => {
+                    if scanout != SCANOUT {
+                        return;
+                    }
+                    self.set_guest_cursor(event_loop, width, height, hot_x, hot_y, &rgba);
+                }
+                // Deliberately not used for positioning. The host pointer is
+                // what moves the guest's, through the absolute tablet, so
+                // warping the Mac's cursor to the position the guest echoes
+                // back would fight the user's own hand — and a round trip
+                // behind it. It is counted in the stats, which is what tells
+                // you the cursor plane is live.
+                UserEvent::Server(ServerMsg::CursorPos { .. }) => {
+                    if let Some(stats) = self.stats.as_mut() {
+                        stats.cursor_moves += 1;
+                        stats.tick();
                     }
                 }
                 UserEvent::Server(ServerMsg::Clipboard { mime, data }) => {
@@ -527,21 +662,25 @@ mod macos {
                     });
                 }
                 WindowEvent::CursorMoved { position, .. } => {
+                    // `CursorEntered` does not fire when the window regains
+                    // focus under a pointer that never left it.
+                    if !self.pointer_inside {
+                        self.pointer_inside = true;
+                        self.apply_cursor();
+                    }
                     if let Some((x, y)) = self.pointer_abs(position.x, position.y) {
                         self.sender.send(&ViewerMsg::Abs { x, y });
                     }
                 }
-                // The guest draws its own cursor at the pointer position it
-                // receives, so the macOS cursor would sit on top of it as a
-                // second arrow. Hide it while the pointer is over a live
-                // scanout; a window without a scanout keeps the host cursor.
                 WindowEvent::CursorEntered { .. } => {
-                    self.set_host_cursor_visible(self.scanout.is_none());
+                    self.pointer_inside = true;
+                    self.apply_cursor();
                 }
                 // winit keeps the cursor hidden while the window is focused
                 // even once the pointer has left it, so restore it explicitly.
                 WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false) => {
-                    self.set_host_cursor_visible(true);
+                    self.pointer_inside = false;
+                    self.apply_cursor();
                 }
                 WindowEvent::MouseInput { state, button, .. } => {
                     let code = match button {
@@ -639,10 +778,21 @@ mod macos {
             last_host_text: None,
             last_guest_text: None,
             warned_mimes: HashSet::new(),
+            cursor: GuestCursor::Software,
+            cursor_hash: 0,
+            pointer_inside: false,
         };
         event_loop
             .run_app(&mut app)
             .map_err(|e| anyhow!("event loop: {e}"))
+    }
+
+    /// Identity of a cursor image, so an unchanged one is not rebuilt.
+    fn hash_cursor(width: u32, height: u32, hot_x: u32, hot_y: u32, rgba: &[u8]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        (width, height, hot_x, hot_y).hash(&mut hasher);
+        rgba.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// winit physical key → Linux `KEY_*` code.

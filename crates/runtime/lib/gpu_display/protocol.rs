@@ -51,6 +51,23 @@ pub enum ServerMsg {
     Disable { scanout: u32 },
     /// The guest's clipboard changed; `data` is base64 of the `mime` payload.
     Clipboard { mime: String, data: String },
+    /// The guest's cursor plane holds a new image; `rgba` is base64 of
+    /// `width * height` RGBA8888 pixels, and empty when the guest hid its
+    /// cursor (`width` and `height` are then 0 too).
+    ///
+    /// The hotspot is in pixels from the top-left of the image. The viewer
+    /// only ever receives this from a guest that drives the cursor plane; one
+    /// that draws its pointer into the scanout sends nothing.
+    Cursor {
+        scanout: u32,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        rgba: String,
+    },
+    /// The guest moved its cursor's hotspot to `(x, y)` in scanout pixels.
+    CursorPos { scanout: u32, x: i32, y: i32 },
 }
 
 /// Messages from the viewer to the sandbox: evdev-style input.
