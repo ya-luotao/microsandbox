@@ -1413,11 +1413,25 @@ fn gpu_virgl_flags_from_env() -> Option<u32> {
 }
 
 /// `MSB_SND=1` attaches a virtio-snd device wired to the host's default audio
-/// output (CoreAudio on macOS, PipeWire on Linux). Unset or anything else: no
-/// sound device. There is no CLI flag yet; the env var is the only opt-in.
+/// output. Unset or anything else: no sound device. There is no CLI flag yet;
+/// the env var is the only opt-in.
+///
+/// The device is compiled in for macOS only (see `crates/runtime/Cargo.toml`):
+/// its host backend is cpal/CoreAudio, and the alternative — PipeWire — would
+/// make every Linux build depend on the PipeWire client library.
 #[cfg(unix)]
 fn snd_from_env() -> bool {
     std::env::var("MSB_SND").is_ok_and(|value| value == "1")
+}
+
+/// Tell the user once that `MSB_SND=1` does nothing on this target, rather
+/// than letting them wonder why the guest has no sound card.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn warn_snd_unsupported() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!("MSB_SND=1 ignored: virtio-snd is macOS-only in this build");
+    });
 }
 
 /// `MSB_GPU_DISPLAY=WIDTHxHEIGHT` sizes the single scanout (default 1920x1080).
@@ -1967,13 +1981,19 @@ fn build_vm(
             );
             // Experimental: attach a virtio-snd device so the guest gets an
             // ALSA card backed by the host's default output. Opt-in via
-            // MSB_SND, independent of the display.
+            // MSB_SND, independent of the display. macOS only — that is where
+            // the `snd` feature, and with it `ConsoleBuilder::sound`, exists.
+            #[cfg(target_os = "macos")]
             let c = if snd_from_env() {
                 tracing::info!("virtio-snd: attaching the host audio device (MSB_SND=1)");
                 c.sound(true)
             } else {
                 c
             };
+            #[cfg(not(target_os = "macos"))]
+            if snd_from_env() {
+                warn_snd_unsupported();
+            }
             // Experimental: attach a virtio-gpu device so the guest gets a DRM
             // node. Opt-in via MSB_GPU while the host display path is built out.
             match gpu_virgl_flags_from_env() {
