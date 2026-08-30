@@ -15,17 +15,27 @@
 //! flush per pointer move.
 //!
 //! `present_frame` must never wait for a viewer: the guest's FLUSH is only
-//! answered once it returns, and the same holds for the cursor methods.
+//! answered once it returns, and the same holds for the cursor methods. So the
+//! gpu worker never touches the socket — it queues onto a bounded channel that
+//! a per-connection writer thread drains. A viewer that stops reading fills the
+//! queue and its messages are dropped rather than blocking the guest: a dropped
+//! frame is superseded by the next one, and a dropped cursor image is re-sent
+//! once the writer catches up, so the viewer is never left showing a stale
+//! cursor.
 
 pub mod clipboard;
 pub mod dump;
 pub mod input;
 pub mod protocol;
 
+use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,10 +55,24 @@ use input::{event, syn, InputDevice};
 use protocol::evdev::*;
 use protocol::{ServerMsg, ViewerMsg, SLOTS};
 
+/// Messages queued for one viewer before the slowest are dropped.
+///
+/// A cursor image is ~22 KB of base64 and the socket buffers hold 8 KB, so a
+/// write on the gpu worker thread would wait for the viewer's reader. The queue
+/// absorbs that; 256 messages is a few frames' worth of slack.
+const VIEWER_QUEUE: usize = 256;
+
 /// A viewer connection; only one is served at a time.
+///
+/// The socket is owned by a writer thread, so nothing the gpu worker does can
+/// block on the viewer reading.
 struct Viewer {
     id: u64,
-    stream: UnixStream,
+    tx: SyncSender<ServerMsg>,
+    /// A cursor image was dropped because the queue was full. The viewer would
+    /// otherwise keep showing a stale cursor, so the writer re-sends the latest
+    /// one once it has caught up.
+    dirty_cursor: Arc<AtomicBool>,
 }
 
 struct ScanoutInfo {
@@ -74,45 +98,77 @@ struct Shared {
 }
 
 impl Shared {
-    fn send(&self, msg: &ServerMsg) {
-        let mut guard = self.viewer.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(viewer) = guard.as_mut() else { return };
-        let mut line = serde_json::to_vec(msg).expect("protocol messages serialize");
-        line.push(b'\n');
-        if let Err(e) = viewer.stream.write_all(&line) {
-            tracing::info!(viewer = viewer.id, error = %e, "gpu display: dropping viewer");
-            *guard = None;
+    /// Queue a message for the viewer. Never blocks: the gpu worker calls this
+    /// from `present_frame` and the cursor methods, and the guest's FLUSH is
+    /// waiting on it.
+    fn send(&self, msg: ServerMsg) {
+        let guard = self.viewer.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(viewer) = guard.as_ref() else { return };
+        match viewer.tx.try_send(msg) {
+            Ok(()) => {}
+            Err(TrySendError::Full(dropped)) => {
+                // A dropped frame is superseded by the next one; a dropped
+                // cursor is not, so remember to re-send the latest image.
+                if matches!(dropped, ServerMsg::Cursor { .. }) {
+                    viewer.dirty_cursor.store(true, Ordering::Relaxed);
+                }
+                tracing::debug!(
+                    viewer = viewer.id,
+                    "gpu display: viewer queue full, dropping"
+                );
+            }
+            // The writer thread is gone; it detaches on its way out.
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
-    fn attach(&self, id: u64, stream: UnixStream) {
-        // A stalled viewer must not stall the guest's FLUSH.
+    /// The latest cursor image of every configured scanout.
+    fn latest_cursors(&self) -> Vec<ServerMsg> {
+        let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        cursors.iter().flatten().cloned().collect()
+    }
+
+    fn attach(&'static self, id: u64, stream: UnixStream) {
+        // A stalled viewer must not stall its writer thread forever either.
         let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+        let (tx, rx) = sync_channel(VIEWER_QUEUE);
+        let dirty_cursor = Arc::new(AtomicBool::new(false));
         {
             let mut guard = self.viewer.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(Viewer { id, stream });
+            *guard = Some(Viewer {
+                id,
+                tx,
+                dirty_cursor: Arc::clone(&dirty_cursor),
+            });
+        }
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("gpu display writer {id}"))
+            .spawn(move || writer_loop(self, id, stream, rx, dirty_cursor))
+        {
+            tracing::warn!(error = %e, "gpu display: writer thread failed");
+            self.detach(id);
+            return;
         }
         tracing::info!(viewer = id, "gpu display: viewer attached");
-        self.send(&ServerMsg::Hello {
+        // Everything below goes through the same queue, so the viewer sees
+        // Hello, then Configure, then the cursor, in that order.
+        self.send(ServerMsg::Hello {
             sandbox: self.sandbox.clone(),
         });
         {
             let scanouts = self.scanouts.lock().unwrap_or_else(|e| e.into_inner());
             for (scanout, info) in scanouts.iter().enumerate() {
                 if let Some(info) = info {
-                    self.send(&configure_msg(scanout as u32, info));
+                    self.send(configure_msg(scanout as u32, info));
                 }
             }
         }
-        {
-            let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
-            for msg in cursors.iter().flatten() {
-                self.send(msg);
-            }
+        for msg in self.latest_cursors() {
+            self.send(msg);
         }
         // A viewer that attached after the guest copied still gets that value.
         if let Some(msg) = self.clipboard.last_guest() {
-            self.send(&msg);
+            self.send(msg);
         }
     }
 
@@ -259,6 +315,39 @@ fn accept_loop(shared: &'static Shared, listener: UnixListener) {
     }
 }
 
+/// Owns the viewer's socket so no write ever happens on the gpu worker thread.
+fn writer_loop(
+    shared: &'static Shared,
+    id: u64,
+    mut stream: UnixStream,
+    rx: Receiver<ServerMsg>,
+    dirty_cursor: Arc<AtomicBool>,
+) {
+    fn write_msg(stream: &mut UnixStream, msg: &ServerMsg) -> io::Result<()> {
+        let mut line = serde_json::to_vec(msg).expect("protocol messages serialize");
+        line.push(b'\n');
+        stream.write_all(&line)
+    }
+
+    for msg in rx {
+        if let Err(e) = write_msg(&mut stream, &msg) {
+            tracing::info!(viewer = id, error = %e, "gpu display: dropping viewer");
+            break;
+        }
+        // Caught up after dropping one or more cursor images: the viewer must
+        // not be left showing a stale cursor.
+        if dirty_cursor.swap(false, Ordering::Relaxed) {
+            for cursor in shared.latest_cursors() {
+                if let Err(e) = write_msg(&mut stream, &cursor) {
+                    tracing::info!(viewer = id, error = %e, "gpu display: dropping viewer");
+                    return shared.detach(id);
+                }
+            }
+        }
+    }
+    shared.detach(id);
+}
+
 fn read_loop(shared: &'static Shared, id: u64, stream: UnixStream) {
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else { break };
@@ -282,6 +371,9 @@ struct Frames {
 pub struct SharedFrameBackend {
     shared: &'static Shared,
     frames: Vec<Option<Frames>>,
+    /// Hash of the cursor image last sent per scanout. Compositors re-set the
+    /// same cursor fb on some pointer paths, and the image is ~22 KB of base64.
+    cursor_hashes: Vec<Option<u64>>,
 }
 
 impl DisplayBackendNew<&'static Shared> for SharedFrameBackend {
@@ -289,6 +381,7 @@ impl DisplayBackendNew<&'static Shared> for SharedFrameBackend {
         Self {
             shared: *userdata.expect("DisplayServer passes its state as userdata"),
             frames: (0..MAX_DISPLAYS).map(|_| None).collect(),
+            cursor_hashes: (0..MAX_DISPLAYS).map(|_| None).collect(),
         }
     }
 }
@@ -359,7 +452,7 @@ impl DisplayBackendBasicFramebuffer for SharedFrameBackend {
             let mut scanouts = self.shared.scanouts.lock().unwrap_or_else(|e| e.into_inner());
             scanouts[scanout_id as usize] = Some(info);
         }
-        self.shared.send(&msg);
+        self.shared.send(msg);
         Ok(())
     }
 
@@ -377,7 +470,7 @@ impl DisplayBackendBasicFramebuffer for SharedFrameBackend {
             let _ = fs::remove_file(path);
         }
         tracing::info!(scanout_id, "gpu display: scanout disabled");
-        self.shared.send(&ServerMsg::Disable {
+        self.shared.send(ServerMsg::Disable {
             scanout: scanout_id,
         });
         Ok(())
@@ -407,7 +500,7 @@ impl DisplayBackendBasicFramebuffer for SharedFrameBackend {
             .and_then(Option::as_mut)
             .ok_or(DisplayBackendError::InvalidScanoutId)?;
         frames.seq += 1;
-        self.shared.send(&ServerMsg::Frame {
+        self.shared.send(ServerMsg::Frame {
             scanout: scanout_id,
             slot: frame_id,
             seq: frames.seq,
@@ -417,11 +510,27 @@ impl DisplayBackendBasicFramebuffer for SharedFrameBackend {
     }
 }
 
-/// The cursor image as RGBA8888, which is what the viewer's custom cursor
-/// wants.
+/// Identity of a cursor image, so an unchanged one is not re-encoded and re-sent.
+fn hash_cursor(image: &CursorImage<'_>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    (image.width, image.height, image.hot_x, image.hot_y).hash(&mut hasher);
+    (image.format as u32).hash(&mut hasher);
+    image.data.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The cursor image as straight-alpha RGBA8888, which is what the viewer's
+/// custom cursor wants.
 ///
 /// virtio-gpu names a format by its bytes in memory order, so `BGRA` is
 /// `[b, g, r, a]`; the `X` variants carry no alpha and become opaque.
+///
+/// The pixels arrive premultiplied — a compositor renders its cursor through
+/// the same GL pipeline as everything else, and the cursor plane carries the
+/// result untouched (measured on Hyprland's arrow: of 182 antialiased edge
+/// pixels, none had a colour channel above its alpha). winit's
+/// `CustomCursor::from_rgba` documents the opposite, so undo the multiply or
+/// every soft edge is darkened toward black.
 fn to_rgba(format: ResourceFormat, data: &[u8]) -> Vec<u8> {
     let (r, g, b, a) = match format {
         ResourceFormat::BGRA => (2, 1, 0, Some(3)),
@@ -434,8 +543,29 @@ fn to_rgba(format: ResourceFormat, data: &[u8]) -> Vec<u8> {
         ResourceFormat::XBGR => (3, 2, 1, None),
     };
     data.chunks_exact(ResourceFormat::BYTES_PER_PIXEL)
-        .flat_map(|px| [px[r], px[g], px[b], a.map_or(0xff, |a| px[a])])
+        .flat_map(|px| {
+            let alpha = a.map_or(0xff, |a| px[a]);
+            [
+                unpremultiply(px[r], alpha),
+                unpremultiply(px[g], alpha),
+                unpremultiply(px[b], alpha),
+                alpha,
+            ]
+        })
         .collect()
+}
+
+/// `colour / alpha`, rounded, for one premultiplied channel.
+fn unpremultiply(colour: u8, alpha: u8) -> u8 {
+    match alpha {
+        // Nothing to recover, and the colour is meaningless at zero coverage.
+        0 => 0,
+        0xff => colour,
+        alpha => {
+            let (colour, alpha) = (u32::from(colour), u32::from(alpha));
+            ((colour * 255 + alpha / 2) / alpha).min(255) as u8
+        }
+    }
 }
 
 /// The guest's cursor plane. `SharedFrameBackend` only forwards it; the viewer
@@ -451,30 +581,45 @@ impl DisplayBackendCursor for SharedFrameBackend {
             return Err(DisplayBackendError::InvalidScanoutId);
         }
         // An empty image is how the guest hides its cursor.
-        let msg = match image {
-            Some(image) => ServerMsg::Cursor {
-                scanout: scanout_id,
-                width: image.width,
-                height: image.height,
-                hot_x: image.hot_x,
-                hot_y: image.hot_y,
-                rgba: base64::engine::general_purpose::STANDARD
-                    .encode(to_rgba(image.format, image.data)),
-            },
-            None => ServerMsg::Cursor {
-                scanout: scanout_id,
-                width: 0,
-                height: 0,
-                hot_x: 0,
-                hot_y: 0,
-                rgba: String::new(),
-            },
+        let (msg, hash) = match image {
+            Some(image) => {
+                let hash = hash_cursor(&image);
+                // The same image again changes nothing on the viewer, and it is
+                // ~22 KB of base64 per send.
+                if self.cursor_hashes[scanout_id as usize] == Some(hash) {
+                    return Ok(());
+                }
+                (
+                    ServerMsg::Cursor {
+                        scanout: scanout_id,
+                        width: image.width,
+                        height: image.height,
+                        hot_x: image.hot_x,
+                        hot_y: image.hot_y,
+                        rgba: base64::engine::general_purpose::STANDARD
+                            .encode(to_rgba(image.format, image.data)),
+                    },
+                    Some(hash),
+                )
+            }
+            None => (
+                ServerMsg::Cursor {
+                    scanout: scanout_id,
+                    width: 0,
+                    height: 0,
+                    hot_x: 0,
+                    hot_y: 0,
+                    rgba: String::new(),
+                },
+                None,
+            ),
         };
+        self.cursor_hashes[scanout_id as usize] = hash;
         {
             let mut cursors = self.shared.cursors.lock().unwrap_or_else(|e| e.into_inner());
             cursors[scanout_id as usize] = Some(msg.clone());
         }
-        self.shared.send(&msg);
+        self.shared.send(msg);
         Ok(())
     }
 
@@ -482,7 +627,7 @@ impl DisplayBackendCursor for SharedFrameBackend {
         if scanout_id as usize >= self.frames.len() {
             return Err(DisplayBackendError::InvalidScanoutId);
         }
-        self.shared.send(&ServerMsg::CursorPos {
+        self.shared.send(ServerMsg::CursorPos {
             scanout: scanout_id,
             x,
             y,
@@ -499,25 +644,26 @@ impl DisplayBackendCursor for SharedFrameBackend {
 mod tests {
     use super::*;
 
-    /// One pixel whose bytes are distinguishable in every position.
-    const PIXEL: [u8; 4] = [0x10, 0x20, 0x30, 0x40];
+    /// One opaque pixel whose bytes are distinguishable in every position.
+    /// Opaque so the channel-order tests are not perturbed by unpremultiply.
+    const PIXEL: [u8; 4] = [0x10, 0x20, 0x30, 0xff];
 
     #[test]
     fn bgra_pixels_become_rgba() {
         // [b, g, r, a] -> [r, g, b, a]
         assert_eq!(
             to_rgba(ResourceFormat::BGRA, &PIXEL),
-            vec![0x30, 0x20, 0x10, 0x40]
+            vec![0x30, 0x20, 0x10, 0xff]
         );
-        // [a, r, g, b] -> [r, g, b, a]
+        // [a, r, g, b] -> [r, g, b, a]; alpha 0x10 scales the rest up
         assert_eq!(
             to_rgba(ResourceFormat::ARGB, &PIXEL),
-            vec![0x20, 0x30, 0x40, 0x10]
+            vec![0xff, 0xff, 0xff, 0x10]
         );
         // [a, b, g, r] -> [r, g, b, a]
         assert_eq!(
             to_rgba(ResourceFormat::ABGR, &PIXEL),
-            vec![0x40, 0x30, 0x20, 0x10]
+            vec![0xff, 0xff, 0xff, 0x10]
         );
         assert_eq!(to_rgba(ResourceFormat::RGBA, &PIXEL), PIXEL.to_vec());
     }
@@ -530,7 +676,7 @@ mod tests {
         );
         assert_eq!(
             to_rgba(ResourceFormat::XRGB, &PIXEL),
-            vec![0x20, 0x30, 0x40, 0xff]
+            vec![0x20, 0x30, 0xff, 0xff]
         );
         assert_eq!(
             to_rgba(ResourceFormat::RGBX, &PIXEL),
@@ -538,19 +684,131 @@ mod tests {
         );
         assert_eq!(
             to_rgba(ResourceFormat::XBGR, &PIXEL),
-            vec![0x40, 0x30, 0x20, 0xff]
+            vec![0xff, 0x30, 0x20, 0xff]
         );
     }
 
     #[test]
     fn every_pixel_is_converted_and_a_short_tail_is_dropped() {
         let mut data = PIXEL.to_vec();
-        data.extend_from_slice(&[1, 2, 3, 4]);
+        data.extend_from_slice(&[10, 20, 30, 40]);
         // A trailing partial pixel cannot be converted and is left out.
         data.extend_from_slice(&[9, 9]);
         assert_eq!(
             to_rgba(ResourceFormat::BGRA, &data),
-            vec![0x30, 0x20, 0x10, 0x40, 3, 2, 1, 4]
+            vec![
+                0x30,
+                0x20,
+                0x10,
+                0xff,
+                unpremultiply(30, 40),
+                unpremultiply(20, 40),
+                unpremultiply(10, 40),
+                40,
+            ]
         );
+    }
+
+    /// Cursor pixels arrive premultiplied; winit wants straight alpha.
+    #[test]
+    fn premultiplied_pixels_are_restored_to_straight_alpha() {
+        // A half-covered white edge pixel: premultiplied it is (128,128,128,128).
+        assert_eq!(
+            to_rgba(ResourceFormat::RGBA, &[128, 128, 128, 128]),
+            vec![255, 255, 255, 128]
+        );
+        // Fully transparent carries no colour at all.
+        assert_eq!(
+            to_rgba(ResourceFormat::RGBA, &[0, 0, 0, 0]),
+            vec![0, 0, 0, 0]
+        );
+        // Opaque pixels are untouched.
+        assert_eq!(
+            to_rgba(ResourceFormat::RGBA, &[10, 20, 30, 255]),
+            vec![10, 20, 30, 255]
+        );
+        // A colour channel above its alpha would not be premultiplied; clamp
+        // rather than overflow.
+        assert_eq!(
+            to_rgba(ResourceFormat::RGBA, &[200, 0, 0, 100]),
+            vec![255, 0, 0, 100]
+        );
+    }
+
+    fn cursor_msg(scanout: u32, rgba: &str) -> ServerMsg {
+        ServerMsg::Cursor {
+            scanout,
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            rgba: rgba.to_string(),
+        }
+    }
+
+    /// A viewer that stops reading must not stall the gpu worker, and must not
+    /// be left showing a cursor that was dropped on the way.
+    #[test]
+    fn a_dropped_cursor_is_resent_once_the_viewer_catches_up() {
+        let (tx, rx) = sync_channel::<ServerMsg>(1);
+        let dirty = Arc::new(AtomicBool::new(false));
+        let viewer = Viewer {
+            id: 1,
+            tx,
+            dirty_cursor: Arc::clone(&dirty),
+        };
+
+        // One message fits; everything after it is dropped rather than blocking.
+        assert!(matches!(viewer.tx.try_send(cursor_msg(0, "first")), Ok(())));
+        let stale = viewer.tx.try_send(cursor_msg(0, "second"));
+        let Err(TrySendError::Full(dropped)) = stale else {
+            panic!("expected a full queue");
+        };
+        // This is the branch `Shared::send` takes for a dropped cursor.
+        assert!(matches!(dropped, ServerMsg::Cursor { .. }));
+        dirty.store(true, Ordering::Relaxed);
+
+        // The writer drains, notices the flag, and re-sends the latest image.
+        assert!(matches!(rx.recv(), Ok(ServerMsg::Cursor { .. })));
+        assert!(dirty.swap(false, Ordering::Relaxed));
+        assert!(!dirty.load(Ordering::Relaxed));
+    }
+
+    /// The same image again is not worth ~22 KB of base64 on the wire.
+    #[test]
+    fn an_unchanged_cursor_image_hashes_the_same() {
+        let pixels = [1u8, 2, 3, 4];
+        let image = |hot_x| CursorImage {
+            width: 1,
+            height: 1,
+            format: ResourceFormat::BGRA,
+            data: &pixels,
+            hot_x,
+            hot_y: 0,
+        };
+        assert_eq!(hash_cursor(&image(0)), hash_cursor(&image(0)));
+        // A moved hotspot is a different cursor even with the same pixels.
+        assert_ne!(hash_cursor(&image(0)), hash_cursor(&image(1)));
+        let other = [1u8, 2, 3, 5];
+        assert_ne!(
+            hash_cursor(&image(0)),
+            hash_cursor(&CursorImage {
+                width: 1,
+                height: 1,
+                format: ResourceFormat::BGRA,
+                data: &other,
+                hot_x: 0,
+                hot_y: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn unpremultiply_rounds_and_saturates() {
+        assert_eq!(unpremultiply(0, 0), 0);
+        assert_eq!(unpremultiply(255, 255), 255);
+        assert_eq!(unpremultiply(64, 128), 128);
+        assert_eq!(unpremultiply(128, 128), 255);
+        assert_eq!(unpremultiply(200, 100), 255);
     }
 }

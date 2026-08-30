@@ -213,7 +213,7 @@ impl ClipboardStream {
         }
         // No viewer attached is normal; `last_guest` replays on the next attach.
         if let Some(shared) = self.state.shared.get() {
-            shared.send(&ServerMsg::Clipboard { mime, data });
+            shared.send(ServerMsg::Clipboard { mime, data });
         }
     }
 

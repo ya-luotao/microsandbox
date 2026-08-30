@@ -13,7 +13,13 @@ through `[patch.crates-io]` until they land upstream:
   panicking on a size mismatch.
 - `msb_krun_display`: the display backend ABI gained a cursor plane
   (`KRUN_DISPLAY_FEATURE_CURSOR`), so the guest's hardware cursor no longer
-  costs a full scanout flush per pointer move.
+  costs a full scanout flush per pointer move. **The upstream libkrun PR must
+  also relax `krun_set_display_backend`**: it rejects
+  `vtable_size < size_of::<DisplayBackend>()` and then `read_unaligned`s the
+  whole struct (`src/libkrun/src/lib.rs:1659-1666`), so once the vtable grows,
+  an old C caller passing the old size gets `-EINVAL` instead of simply
+  lacking the feature. It needs to accept `vtable_size >= the original size`
+  and copy `vtable_size` bytes into a zeroed struct.
 - `msb_krun_utils`: the macOS pipe-based `EventFd` honours `EFD_NONBLOCK`
   when combined with `EFD_SEMAPHORE` (virtio-input never delivered events
   otherwise).

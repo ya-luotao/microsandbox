@@ -724,6 +724,9 @@ mod macos {
     }
 
     fn reader(stream: UnixStream, proxy: EventLoopProxy<UserEvent>) {
+        // A sandbox newer than this viewer sends variants it does not know, and
+        // a cursor-plane guest sends them per pointer move. Warn once per tag.
+        let mut warned: HashSet<String> = HashSet::new();
         for line in BufReader::new(stream).lines() {
             let Ok(line) = line else { break };
             match serde_json::from_str::<ServerMsg>(&line) {
@@ -732,7 +735,15 @@ mod macos {
                         return;
                     }
                 }
-                Err(e) => eprintln!("warning: bad message from sandbox: {e}"),
+                Err(e) => {
+                    let tag = serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|v| v.get("t").and_then(|t| t.as_str()).map(str::to_owned))
+                        .unwrap_or_else(|| "?".to_string());
+                    if warned.insert(tag.clone()) {
+                        eprintln!("warning: ignoring unknown message \"{tag}\" from sandbox: {e}");
+                    }
+                }
             }
         }
         let _ = proxy.send_event(UserEvent::Disconnected);
