@@ -20,6 +20,10 @@ through `[patch.crates-io]` until they land upstream:
   an old C caller passing the old size gets `-EINVAL` instead of simply
   lacking the feature. It needs to accept `vtable_size >= the original size`
   and copy `vtable_size` bytes into a zeroed struct.
+- `msb_krun_devices`: virtio-snd gets a `cpal` host backend so the device
+  works on macOS (CoreAudio); the PipeWire backend and its dependency are now
+  Linux-only, `BackendType` picks the backend per target, and a failing backend
+  answers the guest with a virtio status instead of panicking the worker thread.
 - `msb_krun_utils`: the macOS pipe-based `EventFd` honours `EFD_NONBLOCK`
   when combined with `EFD_SEMAPHORE` (virtio-input never delivered events
   otherwise).

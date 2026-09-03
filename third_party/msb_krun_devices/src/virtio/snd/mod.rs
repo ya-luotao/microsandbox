@@ -149,10 +149,24 @@ impl From<stream::Error> for Error {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+/// The host audio backend a [`Snd`] device drives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendType {
-    #[default]
+    /// PipeWire, through its client library. Linux only.
     Pipewire,
+    /// `cpal`, which talks to CoreAudio on macOS.
+    Cpal,
+}
+
+impl Default for BackendType {
+    /// PipeWire where a daemon can be expected, `cpal` elsewhere.
+    fn default() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Pipewire
+        } else {
+            Self::Cpal
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
