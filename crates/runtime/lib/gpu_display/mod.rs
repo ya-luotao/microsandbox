@@ -33,6 +33,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -105,6 +106,10 @@ struct Viewer {
     id: u64,
     tx: SyncSender<ServerMsg>,
     dirty: Arc<Dirty>,
+    /// A handle on the connection, so a newer viewer can shut it down: the
+    /// old reader then sees EOF and its `msb display` exits, instead of
+    /// keeping a window that never receives another frame.
+    socket: UnixStream,
 }
 
 struct ScanoutInfo {
@@ -159,14 +164,28 @@ impl Shared {
     fn attach(&'static self, id: u64, stream: UnixStream) {
         // A stalled viewer must not stall its writer thread forever either.
         let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+        let socket = match stream.try_clone() {
+            Ok(socket) => socket,
+            Err(e) => {
+                tracing::warn!(error = %e, "gpu display: clone failed");
+                return;
+            }
+        };
         let (tx, rx) = sync_channel(VIEWER_QUEUE);
         let dirty = Arc::new(Dirty::default());
         {
             let mut guard = self.viewer.lock().unwrap_or_else(|e| e.into_inner());
+            // One viewer at a time: the newcomer displaces the old one, whose
+            // reader must see EOF rather than a socket that stays open and silent.
+            if let Some(old) = guard.take() {
+                tracing::info!(viewer = old.id, by = id, "gpu display: viewer displaced");
+                let _ = old.socket.shutdown(Shutdown::Both);
+            }
             *guard = Some(Viewer {
                 id,
                 tx,
                 dirty: Arc::clone(&dirty),
+                socket,
             });
         }
         if let Err(e) = std::thread::Builder::new()
@@ -821,10 +840,12 @@ mod tests {
     fn a_full_queue_drops_rather_than_blocking() {
         let (tx, rx) = sync_channel::<ServerMsg>(1);
         let dirty = Arc::new(Dirty::default());
+        let (socket, _peer) = UnixStream::pair().expect("socketpair");
         let viewer = Viewer {
             id: 1,
             tx,
             dirty: Arc::clone(&dirty),
+            socket,
         };
 
         // One message fits; everything after it is dropped rather than blocking.

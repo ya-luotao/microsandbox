@@ -621,7 +621,7 @@ mod macos {
                     self.apply_guest_clipboard(mime, data);
                 }
                 UserEvent::Disconnected => {
-                    eprintln!("sandbox display closed");
+                    eprintln!("sandbox display closed (the sandbox stopped, or another viewer attached)");
                     event_loop.exit();
                 }
             }
