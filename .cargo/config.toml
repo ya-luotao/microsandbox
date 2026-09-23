@@ -9,3 +9,11 @@ rustflags = [
     "-C",
     "link-args=-Wl,-rpath,\\$$ORIGIN/../lib,-rpath,\\$$ORIGIN,-rpath,\\$$ORIGIN/../../../build",
 ]
+
+# Record SDK 14.5 in LC_BUILD_VERSION regardless of the local Xcode. When a
+# binary is linked against the macOS 27 SDK, Hypervisor.framework on macOS 27
+# fails hv_vcpu_get_pending_interrupt, which breaks execution-state capture
+# (full snapshots, branch). The upstream release binaries are built with
+# SDK 14.5. Cargo joins the rustflags of every matching cfg table.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))']
+rustflags = ["-C", "link-arg=-Wl,-platform_version,macos,11.0,14.5"]
