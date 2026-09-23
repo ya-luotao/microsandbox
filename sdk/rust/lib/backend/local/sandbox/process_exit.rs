@@ -87,6 +87,23 @@ pub(super) fn lifecycle_matches(pid: i32, lifecycle: &Path) -> std::io::Result<b
     Ok((actual.dev(), actual.ino()) == (expected.dev(), expected.ino()))
 }
 
+/// The path `pid`'s inherited lifecycle descriptor points at, as procfs renders it.
+///
+/// The link is rendered from the holder's own mount namespace, so it stays meaningful for a
+/// launcher whose run directory is a different mount of the same layout. `None` when the
+/// descriptor is not open; an unlinked target carries procfs's ` (deleted)` marker.
+pub(super) fn lifecycle_link(pid: i32) -> std::io::Result<Option<std::path::PathBuf>> {
+    let inherited = format!(
+        "/proc/{pid}/fd/{}",
+        microsandbox_runtime::vm::LIFECYCLE_LOCK_FD
+    );
+    match std::fs::read_link(inherited) {
+        Ok(link) => Ok(Some(link)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------

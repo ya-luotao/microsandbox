@@ -59,14 +59,18 @@ impl ProcessIdentity {
         #[cfg(target_os = "linux")]
         {
             let start = linux_start(pid)?;
-            // Older supported kernels may lack pidfd_open. They still have
-            // /proc birth tokens; where available, retain a kernel process handle.
+            // Older supported kernels may lack pidfd_open, and a default seccomp profile can
+            // deny it with EPERM. They still have /proc birth tokens; where available, retain
+            // a kernel process handle.
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
             let handle = if fd >= 0 {
                 Some(unsafe { File::from_raw_fd(fd as i32) })
             } else {
                 let error = std::io::Error::last_os_error();
-                if !matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+                if !matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOSYS | libc::EINVAL | libc::EPERM)
+                ) {
                     return Err(process_lookup_error(error));
                 }
                 None

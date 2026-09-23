@@ -365,12 +365,15 @@ impl LocalBackend {
         let process = Self::recorded_runtime(run.as_ref(), Some(&lifecycle)).live();
         if let Some(process) = &process {
             process.signal(RuntimeSignal::Kill)?;
-            Self::wait_for_runtime_exit(process, Duration::from_secs(5)).await?;
+            Self::wait_for_runtime_exit(process, Duration::from_secs(5)).await;
         }
 
         let all_dead = match &process {
-            Some(process) => process.has_exited()?,
-            None => true,
+            Some(process) => process.has_exited(),
+            // Nothing was signalled. Only write the terminal state when no runtime owns the
+            // name; a verdict that missed a live VM must leave the row to reconciliation
+            // rather than make that VM unreachable through a terminal row.
+            None => Self::lifecycle_is_unowned(&run_dir, name)?,
         };
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(departing) = departing {
@@ -393,6 +396,11 @@ impl LocalBackend {
             {
                 tracing::warn!(sandbox = %name, error = %e, "failed to update sandbox status after kill");
             }
+        } else if process.is_none() {
+            tracing::warn!(
+                sandbox = %name,
+                "no signalable runtime process, but the lifecycle lock is still held; leaving the row for reconciliation"
+            );
         }
 
         Ok(())
@@ -972,16 +980,20 @@ impl LocalBackend {
     }
 
     /// Poll a signalled runtime process until it exits or `timeout` elapses.
-    async fn wait_for_runtime_exit(
-        process: &RuntimeProcess,
-        timeout: Duration,
-    ) -> MicrosandboxResult<()> {
+    async fn wait_for_runtime_exit(process: &RuntimeProcess, timeout: Duration) {
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(50);
-        while !process.has_exited()? && start.elapsed() < timeout {
+        while !process.has_exited() && start.elapsed() < timeout {
             tokio::time::sleep(poll_interval).await;
         }
-        Ok(())
+    }
+
+    /// Whether no process currently owns `name`'s lifecycle lock in this run directory.
+    ///
+    /// The probe acquires and immediately releases the lock, so it must only run while the
+    /// caller holds the name's transition guard.
+    fn lifecycle_is_unowned(run_dir: &Path, name: &str) -> MicrosandboxResult<bool> {
+        Ok(microsandbox_runtime::ipc::try_acquire_lifecycle_guard(run_dir, name)?.is_some())
     }
 
     /// Terminal status + termination reason for a stale Running/Draining row.
@@ -2650,6 +2662,49 @@ mod tests {
                 "{name}: a recycled PID must not be signalled"
             );
         }
+    }
+
+    /// With nothing to signal, kill must not write a terminal row while a runtime still owns
+    /// the name's lifecycle lock: a wrong verdict would otherwise make that VM unreachable.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn kill_without_signalable_process_leaves_an_owned_row_to_reconcile() {
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let backend = Arc::new(
+            crate::test_support::local_backend_builder(home.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.db().await.unwrap();
+        let mut bystander = Bystander::spawn();
+        let id = LocalBackend::insert_sandbox_record(pools.write(), &test_config("kill-owned"))
+            .await
+            .unwrap();
+        insert_active_run(pools, id, bystander.pid(), an_hour_ago()).await;
+        let owner = microsandbox_runtime::ipc::acquire_lifecycle_guard(
+            &backend.config().run_dir(),
+            "kill-owned",
+        )
+        .unwrap();
+
+        backend.kill_sandbox("kill-owned", Some(id)).await.unwrap();
+
+        let (model, pid) = backend
+            .sandbox_handle_state("kill-owned", Some(id))
+            .await
+            .unwrap();
+        assert_eq!(model.status, SandboxStatus::Running);
+        assert_eq!(pid, None);
+        assert!(bystander.is_alive());
+
+        // Once ownership lapses the same row reconciles as stale.
+        drop(owner);
+        let (model, _) = backend
+            .sandbox_handle_state("kill-owned", Some(id))
+            .await
+            .unwrap();
+        assert_eq!(model.status, SandboxStatus::Crashed);
     }
 
     /// The identity check must not make a runtime unkillable: a process older than its row

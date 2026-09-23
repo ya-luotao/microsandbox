@@ -11,6 +11,8 @@ use std::path::Path;
 
 /// Public Darwin proc-info flavor from <sys/proc_info.h>.
 const PROC_PIDFDVNODEINFO: i32 = 1;
+/// Public Darwin proc-info flavor from <sys/proc_info.h>: vnode info plus the vnode's path.
+const PROC_PIDFDVNODEPATHINFO: i32 = 2;
 /// Public Darwin process flag: the process is working on exiting.
 const P_WEXIT: i32 = 0x00002000;
 
@@ -46,6 +48,12 @@ struct ProcFileInfo {
 struct VnodeFdInfo {
     file: ProcFileInfo,
     vnode: libc::vnode_info,
+}
+
+#[repr(C)]
+struct VnodeFdInfoWithPath {
+    file: ProcFileInfo,
+    vnode: libc::vnode_info_path,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -217,6 +225,48 @@ pub(super) fn lifecycle_matches(pid: i32, lifecycle: &Path) -> io::Result<bool> 
         u64::from(info.vnode.vi_stat.vst_dev),
         info.vnode.vi_stat.vst_ino,
     ) == (expected.dev(), expected.ino()))
+}
+
+/// The path `pid`'s inherited lifecycle descriptor points at, as libproc renders it.
+///
+/// `None` when the process is gone or the descriptor is not open.
+pub(super) fn lifecycle_link(pid: i32) -> io::Result<Option<std::path::PathBuf>> {
+    let mut info = std::mem::MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
+    let size = std::mem::size_of::<VnodeFdInfoWithPath>();
+    let result = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            microsandbox_runtime::vm::LIFECYCLE_LOCK_FD,
+            PROC_PIDFDVNODEPATHINFO,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if result <= 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH | libc::EBADF | libc::ENOENT) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    if result as usize != size {
+        return Err(io::Error::other(
+            "incomplete runtime lifecycle descriptor path information",
+        ));
+    }
+    let info = unsafe { info.assume_init() };
+    // libc models the MAXPATHLEN buffer as 32 rows of 32; flatten it back into one C string.
+    let bytes: Vec<u8> = info
+        .vnode
+        .vip_path
+        .iter()
+        .flatten()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as u8)
+        .collect();
+    Ok(Some(std::path::PathBuf::from(
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )))
 }
 
 fn process_state(pid: i32) -> io::Result<Option<ProcessState>> {
@@ -537,5 +587,6 @@ mod tests {
         // Frozen public proc-info wrapper ABI, independently checked against the SDK headers.
         assert_eq!(std::mem::size_of::<ProcFileInfo>(), 24);
         assert_eq!(std::mem::size_of::<VnodeFdInfo>(), 176);
+        assert_eq!(std::mem::size_of::<VnodeFdInfoWithPath>(), 176 + 1024);
     }
 }

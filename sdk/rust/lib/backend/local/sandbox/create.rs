@@ -1723,7 +1723,7 @@ impl LocalBackend {
                 Self::stop_sandbox_for_replacement(
                     pools,
                     &model,
-                    &lifecycle,
+                    run_dir,
                     config.replace_with_timeout,
                 )
                 .await?;
@@ -1811,35 +1811,44 @@ impl LocalBackend {
     /// Replaces the previous "wait 30s and give up" behavior, which spun
     /// the full timeout when libkrun's SIGTERM handler did a slow
     /// graceful shutdown. Only the identity-checked runtime is signalled;
-    /// a recycled PID is left alone and the row is simply marked stopped.
+    /// a recycled PID is left alone. With nothing to signal, the row is
+    /// marked stopped only while no runtime owns the name's lifecycle lock.
     async fn stop_sandbox_for_replacement(
         pools: &DbPools,
         sandbox: &sandbox_entity::Model,
-        lifecycle: &Path,
+        run_dir: &Path,
         grace: std::time::Duration,
     ) -> MicrosandboxResult<()> {
         let run = Self::load_active_run(pools.read(), sandbox.id).await?;
-        let process = Self::recorded_runtime(run.as_ref(), Some(lifecycle)).live();
+        let lifecycle = microsandbox_runtime::ipc::lifecycle_lock_path(run_dir, &sandbox.name);
+        let process = Self::recorded_runtime(run.as_ref(), Some(&lifecycle)).live();
 
-        if let Some(process) = process {
-            // Polite phase: SIGTERM and wait up to `grace` for graceful exit.
-            if !grace.is_zero() {
-                let _ = process.signal(super::RuntimeSignal::Terminate);
-                Self::wait_for_runtime_exit(&process, grace).await?;
-            }
+        match process {
+            Some(process) => {
+                // Polite phase: SIGTERM and wait up to `grace` for graceful exit.
+                if !grace.is_zero() {
+                    let _ = process.signal(super::RuntimeSignal::Terminate);
+                    Self::wait_for_runtime_exit(&process, grace).await;
+                }
 
-            // SIGKILL if still alive, then prove the recorded owner exited
-            // before deterministic sockets or storage can be reused.
-            if !process.has_exited()? {
+                // SIGKILL (a no-op for an exited instance), then prove the recorded
+                // owner exited before deterministic sockets or storage can be reused.
                 process.signal(super::RuntimeSignal::Kill)?;
+                Self::wait_for_runtime_exit(&process, std::time::Duration::from_secs(5)).await;
+                if !process.has_exited() {
+                    return Err(crate::MicrosandboxError::SandboxStillRunning(format!(
+                        "cannot replace sandbox {:?}: runtime did not exit after SIGKILL",
+                        sandbox.name
+                    )));
+                }
             }
-            Self::wait_for_runtime_exit(&process, std::time::Duration::from_secs(5)).await?;
-            if !process.has_exited()? {
+            None if !Self::lifecycle_is_unowned(run_dir, &sandbox.name)? => {
                 return Err(crate::MicrosandboxError::SandboxStillRunning(format!(
-                    "cannot replace sandbox {:?}: runtime did not exit after SIGKILL",
+                    "cannot replace sandbox {:?}: its lifecycle lock is held by a runtime the recorded run does not identify",
                     sandbox.name
                 )));
             }
+            None => {}
         }
 
         Self::mark_sandbox_stopped_for_replacement(
