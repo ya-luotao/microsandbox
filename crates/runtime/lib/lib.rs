@@ -11,6 +11,8 @@ pub mod checkpoint;
 #[cfg(feature = "client")]
 mod client;
 mod error;
+#[cfg(all(feature = "runner", unix))]
+pub mod gpu_display;
 #[cfg(feature = "runner")]
 mod runner;
 

@@ -1784,6 +1784,60 @@ fn writeback_limited_disk_paths(vm: &VmConfig) -> RuntimeResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// virglrenderer init flags (virglrenderer.h) for the experimental virtio-gpu device.
+#[cfg(unix)]
+const VIRGL_RENDERER_VENUS: u32 = 1 << 6;
+#[cfg(unix)]
+const VIRGL_RENDERER_NO_VIRGL: u32 = 1 << 7;
+/// Guest-visible SHM window for virtio-gpu host-mapped blobs (256 MiB).
+#[cfg(unix)]
+const GPU_SHM_SIZE: usize = 1 << 28;
+
+/// `MSB_GPU=1` attaches a 2D-only virtio-gpu; `MSB_GPU=venus` also enables
+/// Venus (Vulkan passthrough via virglrenderer). Unset or anything else: no GPU.
+#[cfg(unix)]
+fn gpu_virgl_flags_from_env() -> Option<u32> {
+    match std::env::var("MSB_GPU").ok()?.as_str() {
+        "1" | "2d" => Some(VIRGL_RENDERER_NO_VIRGL),
+        "venus" => Some(VIRGL_RENDERER_NO_VIRGL | VIRGL_RENDERER_VENUS),
+        _ => None,
+    }
+}
+
+/// `MSB_SND=1` attaches a virtio-snd device wired to the host's default audio
+/// output. Unset or anything else: no sound device. There is no CLI flag yet;
+/// the env var is the only opt-in.
+///
+/// The device is compiled in for macOS only (see `crates/runtime/Cargo.toml`):
+/// its host backend is cpal/CoreAudio, and the alternative — PipeWire — would
+/// make every Linux build depend on the PipeWire client library.
+#[cfg(unix)]
+fn snd_from_env() -> bool {
+    std::env::var("MSB_SND").is_ok_and(|value| value == "1")
+}
+
+/// Tell the user once that `MSB_SND=1` does nothing on this target, rather
+/// than letting them wonder why the guest has no sound card.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn warn_snd_unsupported() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!("MSB_SND=1 ignored: virtio-snd is macOS-only in this build");
+    });
+}
+
+/// `MSB_GPU_DISPLAY=WIDTHxHEIGHT` sizes the single scanout (default 1920x1080).
+#[cfg(unix)]
+fn gpu_display_from_env() -> (u32, u32) {
+    std::env::var("MSB_GPU_DISPLAY")
+        .ok()
+        .and_then(|value| {
+            let (width, height) = value.split_once('x')?;
+            Some((width.parse().ok()?, height.parse().ok()?))
+        })
+        .unwrap_or((1920, 1080))
+}
+
 fn is_writeback_limited_disk(format: msb_krun::DiskImageFormat, read_only: bool) -> bool {
     !read_only && matches!(format, msb_krun::DiskImageFormat::Raw)
 }
@@ -2611,6 +2665,39 @@ fn build_vm(
     // Console — ring-buffer-based custom backend for agent protocol, plus
     // console output routed to kernel.log for kernel/init logs.
     let kernel_log_path = config.log_dir.join("kernel.log");
+    // Frames go to `display.sock` next to the agent socket; the viewer maps
+    // the frame files from the runtime directory.
+    #[cfg(unix)]
+    let mut display_server = if gpu_virgl_flags_from_env().is_some()
+        && std::env::var_os("MSB_GPU_DUMP").is_none()
+    {
+        let socket = crate::ipc::display_socket_path_for(&config.agent_sock_path);
+        match crate::gpu_display::DisplayServer::start(
+            &config.sandbox_name,
+            &config.runtime_dir.join("display"),
+            &socket,
+        ) {
+            Ok(server) => Some(server),
+            Err(e) => {
+                tracing::warn!(error = %e, "gpu display: server not started");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // The clipboard route belongs to the display server, not to the user's
+    // `--vsock` routes: register it here so it exists exactly when a scanout
+    // does. `.vsock()` threads the same builder, so this adds to any routes
+    // configured above rather than replacing them.
+    #[cfg(unix)]
+    if let Some(server) = display_server.as_ref() {
+        let backend: std::sync::Arc<dyn msb_krun::backends::vsock::VsockPortBackend> =
+            server.clipboard_backend();
+        builder = builder.vsock(move |vsock| {
+            vsock.custom(crate::gpu_display::protocol::CLIPBOARD_VSOCK_PORT, backend)
+        });
+    }
     #[cfg(unix)]
     {
         builder = builder.console(|c| {
@@ -2619,12 +2706,59 @@ fn build_vm(
                 Box::new(console_backend),
                 msb_krun::ConsolePortOptions::new().queue_size(agent_queue_size),
             );
-            match bulk_console_backend {
+            let c = match bulk_console_backend {
                 Some(backend) => c.custom_with_options(
                     microsandbox_protocol::AGENT_BULK_PORT_NAME,
                     Box::new(backend),
                     msb_krun::ConsolePortOptions::new().queue_size(AGENT_BULK_QUEUE_SIZE),
                 ),
+                None => c,
+            };
+            // Experimental: attach a virtio-snd device so the guest gets an
+            // ALSA card backed by the host's default output. Opt-in via
+            // MSB_SND, independent of the display. macOS only — that is where
+            // the `snd` feature, and with it `ConsoleBuilder::sound`, exists.
+            #[cfg(target_os = "macos")]
+            let c = if snd_from_env() {
+                tracing::info!("virtio-snd: attaching the host audio device (MSB_SND=1)");
+                c.sound(true)
+            } else {
+                c
+            };
+            #[cfg(not(target_os = "macos"))]
+            if snd_from_env() {
+                warn_snd_unsupported();
+            }
+            // Experimental: attach a virtio-gpu device so the guest gets a DRM
+            // node. Opt-in via MSB_GPU while the host display path is built out.
+            match gpu_virgl_flags_from_env() {
+                Some(flags) => {
+                    let (width, height) = gpu_display_from_env();
+                    let c = c
+                        .gpu_virgl_flags(flags)
+                        .gpu_shm_size(GPU_SHM_SIZE)
+                        .gpu_display(width, height);
+                    // MSB_GPU_DUMP=<dir>: keep the latest scanout frame on disk
+                    // instead of serving it to `msb display`.
+                    if let Some(dir) = std::env::var_os("MSB_GPU_DUMP") {
+                        return c.gpu_display_backend(crate::gpu_display::frame_dump_backend(
+                            std::path::Path::new(&dir),
+                        ));
+                    }
+                    match &mut display_server {
+                        Some(server) => {
+                            let mut c = c.gpu_display_backend(server.display_backend());
+                            if let Some((config, events)) = server.take_keyboard() {
+                                c = c.input_device(config, events);
+                            }
+                            if let Some((config, events)) = server.take_pointer() {
+                                c = c.input_device(config, events);
+                            }
+                            c
+                        }
+                        None => c,
+                    }
+                }
                 None => c,
             }
         });

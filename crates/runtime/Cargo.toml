@@ -26,6 +26,8 @@ runner = [
     "dep:microsandbox-metrics",
     "dep:microsandbox-vsock",
     "dep:msb_krun",
+    "dep:msb_krun_utils",
+    "dep:memmap2",
     "dep:rand",
     "dep:rustls",
     "dep:tempfile",
@@ -55,7 +57,9 @@ microsandbox-protocol.workspace = true
 microsandbox-types.workspace = true
 microsandbox-utils.workspace = true
 microsandbox-vsock = { workspace = true, optional = true }
-msb_krun = { workspace = true, features = ["blk"], optional = true }
+msb_krun = { workspace = true, features = ["blk", "gpu", "input"], optional = true }
+msb_krun_utils = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
 nix = { workspace = true, features = ["process", "signal"] }
 rand = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
@@ -72,6 +76,12 @@ zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Kernel", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+# virtio-snd's only host audio backend is cpal/CoreAudio; on Linux the feature
+# would pull in the PipeWire client library at build time. Keeping `snd` in a
+# macOS-only table means Cargo activates it only when building for macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+msb_krun = { workspace = true, features = ["snd"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 microsandbox-agent-client = { workspace = true, features = ["uds"], optional = true }

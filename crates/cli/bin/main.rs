@@ -8,8 +8,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use console::style;
 use microsandbox_cli::{
     commands::{
-        completion, context, image, install, pull, registry, sandbox, self_cmd, snapshot,
-        uninstall, volume,
+        completion, context, display, image, install, pull, registry, sandbox, self_cmd,
+        snapshot, uninstall, volume,
     },
     log_args::{self, LogArgs},
     machine_cmd::{self, MachineArgs},
@@ -25,7 +25,7 @@ const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
         commands: &[
             "run", "create", "restore", "modify", "start", "stop", "pause", "resume", "branch",
             "restart", "ping", "touch", "list", "status", "metrics", "remove", "exec", "copy",
-            "logs", "ssh", "inspect", "sandbox",
+            "logs", "ssh", "inspect", "display", "sandbox",
         ],
     },
     CommandGroup {
@@ -105,6 +105,9 @@ enum Commands {
     #[cfg(windows)]
     #[command(name = "__windows-self-swap", hide = true)]
     WindowsSelfSwap(self_cmd::WindowsSelfSwapArgs),
+
+    /// Show a running sandbox's display in a native window (macOS).
+    Display(display::DisplayArgs),
 
     /// Manage OCI images.
     Image(image::ImageArgs),
@@ -281,6 +284,8 @@ fn main() {
     let log_level = cli.logs.selected_level();
 
     let exit_code = match cli.command.into_canonical() {
+        // The window event loop owns the main thread; no Tokio needed.
+        Commands::Display(args) => display::run(args),
         Commands::LaunchProtocol => {
             println!(
                 "{}",
@@ -661,7 +666,7 @@ fn run_async_command_anyhow(
         }
 
         match command {
-            Commands::Machine(_) | Commands::LaunchProtocol => {
+            Commands::Machine(_) | Commands::LaunchProtocol | Commands::Display(_) => {
                 unreachable!("handled before Tokio starts")
             }
             Commands::SandboxShortcut(_) => unreachable!("normalized before dispatch"),
