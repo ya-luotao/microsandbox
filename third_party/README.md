@@ -1,0 +1,37 @@
+# Patched msb_krun crates
+
+Copies of the published `msb_krun`, `msb_krun_devices`, `msb_krun_display` and
+`msb_krun_utils` 0.1.39 crates with the changes
+the experimental virtio-gpu display (`MSB_GPU`, `msb display`) needs, applied
+through `[patch.crates-io]` until they land upstream:
+
+- `msb_krun`: `ConsoleBuilder::gpu_display`, `gpu_display_backend`,
+  `input_device`; re-exports `krun_display` and `krun_input`.
+- `msb_krun_devices`: the virtio-gpu runs on rutabaga's 2D component when
+  virgl is off (`NO_VIRGL` without `VENUS`), advertises no virgl/blob/context
+  features, and copies only the scanout rectangle on flush instead of
+  panicking on a size mismatch.
+- `msb_krun_display`: the display backend ABI gained a cursor plane
+  (`KRUN_DISPLAY_FEATURE_CURSOR`), so the guest's hardware cursor no longer
+  costs a full scanout flush per pointer move. **The upstream libkrun PR must
+  also relax `krun_set_display_backend`**: it rejects
+  `vtable_size < size_of::<DisplayBackend>()` and then `read_unaligned`s the
+  whole struct (`src/libkrun/src/lib.rs:1659-1666`), so once the vtable grows,
+  an old C caller passing the old size gets `-EINVAL` instead of simply
+  lacking the feature. It needs to accept `vtable_size >= the original size`
+  and copy `vtable_size` bytes into a zeroed struct.
+- `msb_krun_devices`: virtio-snd gets a `cpal` host backend so the device
+  works on macOS (CoreAudio); the PipeWire backend and its dependency are now
+  Linux-only, `BackendType` picks the backend per target, and a failing backend
+  answers the guest with a virtio status instead of panicking the worker thread.
+- `msb_krun_utils`: the macOS pipe-based `EventFd` honours `EFD_NONBLOCK`
+  when combined with `EFD_SEMAPHORE` (virtio-input never delivered events
+  otherwise).
+
+Each change is one commit on top of the published crate in the patch
+repositories this tree was copied from; `git log -p` there is the PR.
+
+The patches are the gpu-m3 ones (made against 0.1.32), re-applied to
+pristine 0.1.39. None of the patched sources changed upstream between the
+two versions; only the `pw`/`cpal` target tables in
+`msb_krun_devices/Cargo.toml` had to be re-added by hand.
