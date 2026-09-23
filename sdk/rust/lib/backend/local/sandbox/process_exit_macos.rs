@@ -183,7 +183,11 @@ fn register_exit(pid: i32) -> io::Result<Option<OwnedFd>> {
     }
 }
 
-fn lifecycle_matches(pid: i32, lifecycle: &Path) -> io::Result<bool> {
+/// Whether `pid` holds the sandbox's lifecycle lock file on the runtime's inherited descriptor.
+///
+/// Only the live runtime of this sandbox name holds that exclusive lock, so a match identifies
+/// the process beyond its PID. A missing process or descriptor is `false`.
+pub(super) fn lifecycle_matches(pid: i32, lifecycle: &Path) -> io::Result<bool> {
     let mut info = std::mem::MaybeUninit::<VnodeFdInfo>::zeroed();
     let size = std::mem::size_of::<VnodeFdInfo>();
     let result = unsafe {

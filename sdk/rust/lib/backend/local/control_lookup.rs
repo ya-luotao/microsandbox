@@ -37,17 +37,18 @@ impl LocalBackend {
         }
         let (model, _) = self.sandbox_handle_state(name, Some(expected_id)).await?;
         let run = Self::load_active_run(self.db().await?.read(), model.id).await?;
-        let run = run
-            .filter(|run| run.pid.is_some_and(Self::pid_is_alive))
-            .ok_or_else(|| {
-                MicrosandboxError::SandboxNotRunning(format!(
-                    "sandbox {name:?} has no live runtime"
-                ))
-            })?;
+        let lifecycle =
+            microsandbox_runtime::ipc::lifecycle_lock_path(&self.config().run_dir(), name);
+        let pid = Self::pid_from_run(run.as_ref(), Some(&lifecycle));
+        let (Some(run), Some(pid)) = (run, pid) else {
+            return Err(MicrosandboxError::SandboxNotRunning(format!(
+                "sandbox {name:?} has no live runtime"
+            )));
+        };
         Ok(SandboxRunIdentity {
             sandbox_id: model.id,
             run_id: run.id,
-            pid: run.pid.expect("live run has a PID"),
+            pid,
         })
     }
 
@@ -142,7 +143,9 @@ impl LocalBackend {
             return Ok(None);
         }
         let run = Self::load_active_run(&read, model.id).await?;
-        let pid = Self::pid_from_run(run.as_ref());
+        let lifecycle =
+            microsandbox_runtime::ipc::lifecycle_lock_path(&self.config().run_dir(), name);
+        let pid = Self::pid_from_run(run.as_ref(), Some(&lifecycle));
         // Do not clean up sockets from this read-only observation. The slow path rechecks
         // the exact row/run under lifecycle ownership before touching stale artifacts.
         if let (Some(run), Some(pid)) = (run, pid) {
